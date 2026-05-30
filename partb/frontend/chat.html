@@ -1,0 +1,1220 @@
+chat.html
+
+<!DOCTYPE html>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>KRUTRIM — ISRO Knowledge Retrieval</title>
+<script src="static/marked.min.js"></script>
+<script src="/static/mermaid.min.js"></script>
+<script src="/static/pdf.min.js"></script>
+<script>
+	pdfjsLib.GlobalWorkerOptions.workerSrs = "/static/pdf.worker.min.js"
+</script>
+<style>
+
+/* ── Reset & Base ─────────────────────────────────────────────── */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { height: 100%; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0f1117; color: #e2e8f0; font-size: 14px; }
+::-webkit-scrollbar{width:6px}::-webkit-scrollbar-track{background: transparent}
+::-webkit-scrollbar-thumb{background: #2d3748;border-radius: 3px}
+::-webkit-scrollbar-thumb:hover{background: #3b4a5c}
+
+/* ── Layout ──────────────────────────────────────────────────── */
+#app { display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
+#brand-bar {
+  flex-shrink: 0; height: 48px; display: flex; align-items: center; justify-content: space-between;
+  padding: 0 18px; background: linear-gradient(90deg, #0a1628 0%, #111827 50%, #0a1628 100%);
+  border-bottom: 1px solid #1e3a5f; gap: 16px;
+}
+.brand-wordmark { display: flex; flex-direction: column; align-items: center; flex: 1}
+.kw-main { font-size: 15px; font-weight: 800; letter-spacing: 0.22em; color: #e2e8f0}
+.kw-sub { font-size: 10px; color: #64748b; letter-spacing: 0.12em; text-transform: uppercase; margin-top: 2px}
+#user-role-display { font-size: 11px; color: #94a3b8; max-width: 160px; text-align: right; white-space:nowrap: overflow:hidden; text-overflow:ellipsis}
+#app-inner { display: flex; flex: 1; min-height: 0; overflow: hidden}
+
+/* ── Sidebar ─────────────────────────────────────────────────── */
+#sidebar {
+  width: 240px; min-width: 240px; background: #161b27; border-right: 1px solid #1e2736; display:flex; flex-direction: column;
+}
+#sidebar-header {
+  padding: 16px; border-bottom: 1px solid #1e2736;
+  display: flex; align-items: center; justify-content: space-between;
+}
+#sidebar-header h2 { font-size: 13px; font-weight: 600; color: #94a3b8; letter-spacing: 0.06em; text-transform: uppercase; }
+#new-chat-btn {
+  background: #2563eb; color: #fff; border: none; border-radius: 6px;
+  padding: 5px 10px; font-size: 12px; font-weight: 500; cursor: pointer;
+  display: flex; align-items: center; gap: 4px;
+}
+#new-chat-btn:hover { background: #1d4ed8; }
+#chat-list { flex: 1; overflow-y: auto; padding: 8px; }
+.chat-item {
+  padding: 10px 12px; border-radius: 8px; cursor: pointer;
+  margin-bottom: 2px; transition: background 0.15s;
+  display: flex; align-items: flex-start; gap: 8px;
+}
+.chat-item:hover { background: #1e2736; }
+.chat-item.active { background: #1e2a3d; border: 1px solid #2563eb33; }
+.chat-item-icon { font-size: 14px; margin-top: 1px; flex-shrink: 0; }
+.chat-item-body { min-width: 0; }
+.chat-item-title { font-size: 13px; font-weight: 500; color: #cbd5e1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.chat-item-meta  { font-size: 11px; color: #475569; margin-top: 2px; }
+.chat-item-delete {
+  margin-left: auto; background: none; border: none; color: #475569;
+  cursor: pointer; font-size: 14px; padding: 2px 4px; border-radius: 4px;
+  opacity: 0; transition: opacity 0.15s;
+}
+.chat-item:hover .chat-item-delete { opacity: 1; }
+.chat-item-delete:hover { color: #ef4444; background: #ef444420; }
+
+
+
+/* ── Main Area ───────────────────────────────────────────────── */
+#main { flex: 1; display: flex; overflow: hidden}
+#chat-panel { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+#chat-header { padding: 14px 20px; border-bottom: 1px solid #1e2736; display: flex; align-items: center; gap: 10px; min-height: 56px; }
+#chat-title { font-size: 15px; font-weight: 600; color: #e2e8f0; flex: 1; }
+#book-chips-area { display: flex; gap: 6px; flex-wrap: wrap; }
+.book-chip-header {
+  background: #1e2736; border: 1px solid #2d3748; color: #94a3b8;
+  font-size: 11px; padding: 3px 8px; border-radius: 20px;
+}
+
+
+
+/* ── Messages ────────────────────────────────────────────────── */
+#messages-area { flex: 1; overflow-y: auto; padding: 24px 20px; display: flex; flex-direction: column; gap: 20px; }
+#empty-state { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; color: #475569; }
+#empty-state .icon { font-size: 48px; }
+#empty-state h3 { font-size: 18px; color: #64748b; font-weight: 500; }
+#empty-state p  { font-size: 13px; color: #475569; text-align: center; max-width: 320px; }
+.suggestion-chips{display:flex; gap:8px; flex-wrap:wrap; justify-content: center; margin-top:8px}
+.suggestion-chips{padding: 7px 14px; border: 1px solid #2d3748; border-radius: 20px; font-size: 12px; color: #64748b; cursor:pointer; transtion: all .15s}
+.suggestion-chips:hover{border-color:#3b82f6; color:#93c5fd}
+.msg-row { display: flex; flex-direction: column; gap: 8px; }
+.msg-user {
+  align-self: flex-end; max-width: 70%;
+  background: #1e3a5f; border: 1px solid #2563eb33;
+  border-radius: 12px 12px 2px 12px; padding: 12px 16px;
+}
+.msg-user-text { color: #e2e8f0; line-height: 1.6; }
+.msg-user-meta { display: flex; justify-content: flex-end; margin-top: 6px; gap: 6px; align-items: center; }
+.mode-badge {
+  font-size: 10px; padding: 2px 7px; border-radius: 20px; font-weight: 500;
+}
+.mode-badge.fast     { background: #15803d20; color: #4ade80; border: 1px solid #15803d40; }
+.mode-badge.balanced { background: #1d4ed820; color: #60a5fa; border: 1px solid #1d4ed840; }
+.mode-badge.deep     { background: #7c3aed20; color: #a78bfa; border: 1px solid #7c3aed40; }
+
+.msg-assistant { align-self: flex-start; max-width: 85%; }
+.msg-assistant-text {
+  color: #e2e8f0; line-height: 1.75;
+  background: #161b27; border: 1px solid #1e2736;
+  border-radius: 2px 12px 12px 12px; padding: 14px 18px;
+}
+.msg-assistant-text.streaming { border-color: #2563eb40; }
+
+
+
+
+/* Markdown inside assistant message */
+.msg-assistant-text h1,.msg-assistant-text h2,.msg-assistant-text h3 { color: #93c5fd; margin: 12px 0 6px; font-size: 15px; }
+.msg-assistant-text p   { margin-bottom: 8px; }
+.msg-assistant-text ul,.msg-assistant-text ol { padding-left: 20px; margin-bottom: 8px; }
+.msg-assistant-text li  { margin-bottom: 4px; }
+.msg-assistant-text strong { color: #93c5fd; }
+.msg-assistant-text code { background: #1e2736; padding: 1px 5px; border-radius: 4px; font-family: monospace; font-size: 12px; }
+.msg-assistant-text pre  { background: #1e2736; padding: 12px; border-radius: 8px; overflow-x: auto; margin-bottom: 8px; }
+.msg-assistant-text pre code { background: none; padding: 0; }
+.msg-assistant-text table {width:100%; border-collapse: collapse; margin-bottom:8px}
+.msg-assistant-text th, .msg-assistant-text td{ border:1px solid #2d3748; padding: 6px 10px; font-size;12px}
+.msg-assistant-text th{ background: #1e2736 }
+.msg-assistant-text blockquote { border-left:3px solid #2563eb; padding-left:12PX; color: #94a3b8; margin:8px 0 }
+
+.status-msg { color: #475569; font-size: 12px; display: flex; align-items: center; gap: 6px; padding: 4px 0; }
+.status-dot { width: 6px; height: 6px; border-radius: 50%; background: #3b82f6; animation: pulse 1.5s infinite; }
+@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.3; } }
+
+.sources-row { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 4px; }
+.source-chip {
+  background: #1e2736; border: 1px solid #2d3748; color: #94a3b8;
+  font-size: 11px; padding: 4px 10px; border-radius: 20px; cursor: pointer;
+  transition: all 0.15s; display: flex; align-items: center; gap: 4px;
+}
+.source-chip:hover { background: #1e3a5f; border-color: #2563eb60; color: #93c5fd; }
+.source-chip.active { background: #1e3a5f; border-color: #2563eb; color: #60a5fa; }
+
+.msg-actions { display: flex; gap: 6px; margin-top: 4px; align-items: center; }
+.regen-btn {
+  background: none; border: 1px solid #1e2736; color: #64748b;
+  font-size: 11px; padding: 3px 10px; border-radius: 6px; cursor: pointer;
+  display: flex; align-items: center; gap: 4px; transition: all 0.15s;
+}
+.regen-btn:hover { border-color: #2563eb60; color: #93c5fd; background: #1e3a5f20; }
+
+.regen-menu {
+  position: absolute; background: #161b27; border: 1px solid #1e2736;
+  border-radius: 8px; padding: 4px; z-index: 100;
+  box-shadow: 0 4px 20px rgba(0,0,0,0.4);
+}
+.regen-opt {
+  padding: 7px 14px; border-radius: 6px; cursor: pointer; font-size: 12px;
+  color: #94a3b8; display: flex; align-items: center; gap: 8px;
+  transition: background 0.15s;
+}
+.regen-opt:hover { background: #1e2736; color: #e2e8f0; }
+
+#input-area { padding: 12px 20px 16px; border-top: 1px solid #1e2736; }
+#input-box {
+  background: #161b27; border: 1px solid #1e2736; border-radius: 12px;
+  padding: 10px 12px 10px 16px; display: flex; flex-direction: column;
+  gap: 8px; transition: border-color 0.15s;
+}
+#input-box:focus-within { border-color: #2563eb60; }
+#question-input {
+  background: transparent; border: none; outline: none; resize: none;
+  color: #e2e8f0; font-size: 14px; line-height: 1.5; font-family: inherit;
+  min-height: 40px; max-height: 160px; overflow-y: auto;
+}
+#question-input::placeholder { color: #475569; }
+#input-row { display: flex; align-items: center; justify-content: space-between; }
+
+/* Mode button */
+#mode-btn {
+  display: flex; align-items: center; gap: 5px; background: #1e2736;
+  border: 1px solid #2d3748; border-radius: 20px; padding: 5px 10px 5px 8px;
+  cursor: pointer; font-size: 12px; font-weight: 500; color: #94a3b8;
+  transition: all 0.15s; position: relative;
+}
+#mode-btn:hover { border-color: #3b82f6; color: #e2e8f0; }
+#mode-popup {
+  display: none; position: absolute; bottom: calc(100% + 8px); left: 0;
+  width: 260px; background: #161b27; border: 1px solid #1e2736;
+  border-radius: 10px; padding: 6px; z-index: 200;
+  box-shadow: 0 8px 32px rgba(0,0,0,0.5);
+}
+.mode-popup-label { font-size: 10px; color: #475569; padding: 4px 10px 6px; letter-spacing: 0.08em; text-transform: uppercase; }
+.mode-opt {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 9px 10px; border-radius: 8px; cursor: pointer; margin-bottom: 2px;
+  transition: background 0.15s; border: 1px solid transparent;
+}
+.mode-opt:hover { background: #1e2736; }
+.mode-opt.selected { background: #1e3a5f30; border-color: #2563eb40; }
+.mode-opt-left { display: flex; align-items: center; gap: 9px; }
+.mode-opt-icon { font-size: 16px; }
+.mode-opt-name { font-size: 13px; font-weight: 500; color: #e2e8f0; }
+.mode-opt-desc { font-size: 11px; color: #64748b; }
+.mode-check { width: 16px; height: 16px; border-radius: 50%; border: 1.5px solid #2d3748; flex-shrink: 0; display: flex; align-items: center; justify-content: center; }
+.mode-check.on { background: #1d4ed8; border-color: #3b82f6; }
+
+#send-btn {
+  background: #2563eb; color: #fff; border: none; border-radius: 8px;
+  padding: 8px 18px; font-size: 13px; font-weight: 500; cursor: pointer;
+  display: flex; align-items: center; gap: 6px; transition: background 0.15s;
+}
+#send-btn:hover { background: #1d4ed8; }
+#send-btn:disabled { background: #1e2736; color: #475569; cursor: not-allowed; }
+
+
+
+/* ── Book Viewer Panel ──────────────────────────────────────── */
+#book-panel {
+  width: 0; overflow: hidden; border-left: 1px solid transparent;
+  background: #161b27; display: flex; flex-direction: column;
+  transition: width 0.3s ease, border-color 0.3s;
+  flex-shrink: 0;
+}
+#book-panel.open {
+  width: 480px; min-width: 480px; border-color: #1e2736;
+}
+#book-panel-header {
+  padding: 14px 16px; border-bottom: 1px solid #1e2736;
+  display: flex; align-items: center; justify-content: space-between;
+  min-height: 56px;flex-shrink: 0;
+}
+#book-panel-title { font-size: 13px; font-weight: 600; color: #94a3b8; }
+#book-panel-subtitle { font-size: 12px; color: #475569; margin-top: 2px; }
+#book-panel-close {
+  background: none; border: none; color: #475569; cursor: pointer;
+  font-size: 18px; padding: 2px 6px; border-radius: 4px;
+}
+#book-panel-close:hover { color: #e2e8f0; background: #1e2736; }
+
+
+/* ── PDF Nav Bar ─────────────────────────────────────────────── */
+#book-panel-nav {
+  padding: 10px 14px; border-bottom: 1px solid #1e2736;
+  display: flex; align-items: center; gap: 8px;
+  flex-shrink: 0; background: #0f1117;
+}
+.nav-btn {
+  background: #1e2736; border: 1px solid #2d3748; color: #94a3b8;
+  font-size: 12px; padding: 5px 14px; border-radius: 6px; cursor: pointer;
+  transition: all 0.15s; font-weight: 500; user-select: none;
+}
+.nav-btn:hover:not(:disabled) { border-color: #3b82f6; color: #93c5fd; background: #1e3a5f20; }
+.nav-btn:disabled { opacity: 0.3; cursor: not-allowed; }
+#pdf-page-input {
+  width: 52px; background: #1e2736; border: 1px solid #2d3748; border-radius: 6px;
+  color: #e2e8f0; font-size: 12px; text-align: center; padding: 5px 4px;
+  outline: none; transition: border-color 0.15s;
+}
+#pdf-page-input:focus { border-color: #2563eb; }
+#pdf-page-total { font-size: 12px; color: #475569; white-space: nowrap; }
+
+
+/* ──PDF Content Area ─────────────────────────────────────────────── */
+
+#pdf-placeholder {
+  flex: 1; display: flex; align-items: center; justify-content: center;
+  color: #475569; font-size: 13px; padding: 40px; text-align: center;
+}
+#pdf-loading {
+  flex: 1; display: none; align-items: center; justify-content: center;
+  gap: 10px; color: #475569; font-size: 13px;
+}
+
+
+
+
+/* ── Modal ───────────────────────────────────────────────────── */
+#modal-overlay {
+  display: none; position: fixed; inset: 0;
+  background: rgba(0,0,0,0.7); z-index: 500;
+  align-items: center; justify-content: center;
+}
+#modal-overlay.show { display: flex; }
+#modal {
+  background: #161b27; border: 1px solid #1e2736; border-radius: 12px;
+  padding: 24px; width: 480px; max-width: 95vw;
+  box-shadow: 0 20px 60px rgba(0,0,0,0.6);
+}
+#modal h2 { font-size: 16px; font-weight: 600; color: #e2e8f0; margin-bottom: 20px; }
+.modal-section { margin-bottom: 20px; }
+.modal-section label { font-size: 12px; font-weight: 500; color: #94a3b8; display: block; margin-bottom: 10px; letter-spacing: 0.06em; text-transform: uppercase; }
+.book-select-list { display: flex; flex-direction: column; gap: 6px; max-height: 200px; overflow-y: auto; }
+.book-select-item {
+  display: flex; align-items: center; gap: 10px; padding: 10px 12px;
+  background: #1e2736; border: 1px solid #2d3748; border-radius: 8px;
+  cursor: pointer; transition: all 0.15s;
+}
+.book-select-item:hover { border-color: #3b82f6; }
+.book-select-item.checked { border-color: #2563eb; background: #1e3a5f30; }
+.book-select-item input[type=checkbox] { accent-color: #2563eb; width: 14px; height: 14px; }
+.book-select-name { font-size: 13px; color: #e2e8f0; font-weight: 500; }
+.book-select-meta { font-size: 11px; color: #64748b; }
+.mode-radio-group { display: flex; gap: 8px; }
+.mode-radio {
+  flex: 1; padding: 10px; background: #1e2736; border: 1px solid #2d3748;
+  border-radius: 8px; cursor: pointer; text-align: center; transition: all 0.15s;
+}
+.mode-radio:hover { border-color: #3b82f6; }
+.mode-radio.selected { border-color: #2563eb; background: #1e3a5f30; }
+.mode-radio-icon { font-size: 18px; display: block; margin-bottom: 4px; }
+.mode-radio-name { font-size: 12px; font-weight: 500; color: #e2e8f0; }
+.modal-actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 4px; }
+.btn-cancel { background: #1e2736; border: 1px solid #2d3748; color: #94a3b8; padding: 8px 18px; border-radius: 8px; cursor: pointer; font-size: 13px; }
+.btn-cancel:hover { border-color: #3b82f6; color: #e2e8f0; }
+.btn-primary { background: #2563eb; color: #fff; border: none; padding: 8px 20px; border-radius: 8px; cursor: pointer; font-size: 13px; font-weight: 500; }
+.btn-primary:hover { background: #1d4ed8; }
+.error-text { color: #f87171; font-size: 12px; margin-top: 6px; display: none; }
+
+/* ── LOGO ── */
+    .logo { text-align: center; margin-bottom: -28px; width: 225px; margin-left: 35px;}
+    .logo img { height: 151px; width: auto; object-fit: contain; display: block; margin: 0 auto;width: 225px; margin-left: 35px; }
+    .logo-main  { text-align: center; margin-bottom: -8px; width: 112px; margin-left: 28px; margin-right: -17px; }
+
+/* ── Login  ────────────────────────────────────── */
+#login-screen {
+  position: fixed; inset: 0; background: #0f1117;
+  display: flex; align-items: center; justify-content: center; z-index: 999;
+}
+#login-box {
+  background: #161b27; border: 1px solid #1e2736; border-radius: 16px;
+  padding: 40px; width: 360px;
+}
+#login-box h1 { font-size: 20px; color: #e2e8f0; margin-bottom: 6px; text-align: center;}
+#login-box p  { font-size: 13px; color: #64748b; margin-bottom: 24px; }
+.auth-tabs { display: flex; margin-bottom: 20px; border-bottom: 1px solid #1e2736; }
+.auth-tab {
+  flex: 1; padding: 10px; text-align: center; font-size: 13px; font-weight: 500;
+  color: #64748b; cursor: pointer; border-bottom: 2px solid transparent; margin-bottom: -1px;
+}
+.auth-tab:hover { color: #94a3b8; }
+.auth-tab.active { color: #3b82f6; border-bottom-color: #3b82f6; }
+.auth-form { display: none; }
+.auth-form.active { display: block; }
+.field { margin-bottom: 14px; }
+.field label { font-size: 12px; color: #94a3b8; display: block; margin-bottom: 6px; }
+.field input {
+  width: 100%; background: #1e2736; border: 1px solid #2d3748;
+  border-radius: 8px; padding: 10px 12px; color: #e2e8f0; font-size: 14px; outline: none; font-family: inherit
+}
+.field input:focus { border-color: #2563eb; }
+#login-error { color: #f87171; font-size: 12px; margin-bottom: 12px; display: none; }
+#login-btn, #signup-btn {
+  width: 100%; background: #2563eb; color: #fff; border: none; border-radius: 8px;
+  padding: 11px; font-size: 14px; font-weight: 500; cursor: pointer; margin-top: 4px;
+}
+#login-error{color: #f87171;font_size:12px; margin_bottom:12px; display:none}
+#login-btn:,#signup-btn{ width:100%; background:#2563eb; color:#fff; border:none; border_radius:8px; padding:11px; font-size: 14px; font_weight:500; cursor: pointer; margin-top: 4px}
+#login-btn:hover, #signup-btn:hover { background: #1d4ed8; }
+
+
+/* ── Loading spinner ─────────────────────────────────────────── */
+.spinner { display: inline-block; width: 14px; height: 14px; border: 2px solid #2d3748; border-top-color: #3b82f6; border-radius: 50%; animation: spin 0.6s linear infinite}
+@keyframes spin { to { transform: rotate(360deg)} }
+</style>
+</head>
+<body>
+
+<!-- ── Login / Signup Screen ─────────────────────────────────── -->
+<div id="login-screen">
+  <div id="login-box">
+    <img src= "/static/isro-logo.png" class="logo" alt= "ISRO"
+    onerror= "this.style.display='none'; this.nextElementsSibling.style.display= 'block';">
+    <h1>KRUTRIM</h1>
+    <p>ISRO knowledge retrieval — sign in or create an account</p>
+    <div class="auth-tabs">
+      <span class="auth-tab active" onclick="showAuthForm('login')">Sign in</span>
+      <span class="auth-tab" onclick="showAuthForm('signup')">Sign up</span>
+    </div>
+    <div id="form-login" class="auth-form active">
+      <div id="login-error"></div>
+      <div class="field">
+        <label>Email</label>
+        <input type="email" id="login-email" placeholder="Enter email" autocomplete="email" onkeydown="if(event.key=='Enter')doLogin()"/>
+      </div>
+      <div class="field">
+        <label>Password</label>
+        <input type="password" id="login-password" placeholder="Enter password" autocomplete="current-password" onkeydown="if(event.key=='Enter')doLogin()"/>
+        <button id="login-btn" onclick="doLogin()">Sign In</button>
+      </div>
+    <div id="form-signup" class="auth-form">
+    <div id= "signup-error" style="color: #f87171; font-size: 12px; margin-bottom: 12px; display: none"></div>
+      <div class="field">
+        <label>Name</label>
+        <input type="text" id="signup-name" placeholder="Your name"/>
+      </div>
+      <div class="field">
+        <label>Email</label>
+        <input type="email" id="signup-email" placeholder="Enter email"/>
+      </div>
+      <div class="field">
+        <label>Password (min 6 chars) </label>
+        <input type="password" id="signup-password" placeholder="Enter password" onkeydown="if(event.key=='Enter')doLogin()"/>
+      </div>
+      <button id="signup-btn" onclick="doSignup()">Create account</button>
+    </div>
+  </div>
+</div>
+  
+
+
+<!-- ── Main App ──────────────────────────────────────────────── -->
+<div id="app" style="display:none;">
+  <div id="brand-bar">
+  <div style="display:flex; slign-items: center; gap: 10px">
+    <img src= "/static/isro-logo.png" class="logo" alt= "ISRO"
+    onerror= "this.style.display='none'; this.nextElementsSibling.style.display= 'block';">
+    <span id= "health-indicator" style="font-size: 11px; color: #475569">-</span>
+   </div>
+   <div class="brand-wordmark">
+      <span class="kw-main">KRUTRIM</span>
+      <span class="kw-sub">ISRO Knoeledge Retrieval</span>
+    </div>
+    <div id="user-role-display"></div>
+  </div>
+  <div id="app-inner">
+
+  <!-- Sidebar -->
+  <nav id="sidebar">
+    <div id="sidebar-header">
+      <h2>Chats</h2>
+      <button id="new-chat-btn" onclick="openNewChatModal()">+ New</button>
+    </div>
+    <div id="chat-list">
+      <div style="color:#475569;font-size:12px;padding:16px;color: #475569">No chats yet</div>
+    </div>
+  </nav>
+
+  <!-- Main panel -->
+  <div id="main">
+
+    <!-- Chat Panel -->
+    <div id="chat-panel">
+      <div id="chat-header">
+        <div id="chat-title" style="color:#475569;">Select or create a chat</div>
+        <div id="book-chips-area"></div>
+      </div>
+      <div id="messages-area">
+        <div id="empty-state">
+          <div class="icon">🛰</div>
+          <h3>KRUTRIM</h3>
+          <p>Your ISRO technical document assistant.Create a chat to being qurying the knowledge base.</p>
+          <div class= "Suggeston-chips">
+             <div class= "Suggeston-chips" onclick="useSuggestion(this)">What is DFSAR?</div>
+             <div class= "Suggeston-chips" onclick="useSuggestion(this)">Chandrayaan-3 mission objectives?</div>
+             <div class= "Suggeston-chips" onclick="useSuggestion(this)">GSLV launch sequence?</div>
+             <div class= "Suggeston-chips" onclick="useSuggestion(this)">SAR instruments specifications?</div>
+          </div>
+        </div>
+      </div>
+      <div id="input-area">
+        <div id="input-box">
+          <textarea id="question-input" rows = "1" placeholder="Ask a question from your selected documents..."
+            onkeydown="handleKey(event)" oninput="autoResize(this)"></textarea>
+          <div id="input-row">
+<!-- Mode picker -->
+            <div id ="mode-btn" onclick="toggleModePopup(event)">
+                <span id="mode-icon">⚖</span>
+                <span id="mode-label">Balanced</span>
+                <span style="font-size:10px ; opacity: .6"></span>
+                <div id="mode-popup" onclick= "event.stopPropagation()">
+                  <div class="mode-popup-label">Response Mode</div>
+                  <div class="mode-opt" id="mode-otp-fast" onclick="selectMode('fast')">
+                    <div class="mode-opt-left"><span class="mode-opt-icon">⚡</span><div><div>
+                    class="mode-opt-name">fast</div><div class= "mode-opt-desc"> 2-4 sentences</div></div></div>
+                    <div class="mode-check" id="mc-fast"></div>
+                   </div> 
+                   <div class="mode-opt selected" id="mode-otp-balanced" onclick="selectMode('balanced')">
+                     <div class="mode-opt-left"><span class="mode-opt-icon">⚖</span><div><div>
+                    class="mode-opt-name">balanced</div><div class= "mode-opt-desc"> 1-3 sentences</div></div></div>
+                    <div class="mode-check" id="mc-balanced"></div>
+                  </div>
+                  <div class="mode-opt selected" id="mode-otp-deep" onclick="selectMode('deep')">
+                     <div class="mode-opt-left"><span class="mode-opt-icon">🧠</span><div><div>
+                    class="mode-opt-name">balanced</div><div class= "mode-opt-desc"> full analysis</div></div></div>
+                    <div class="mode-check" id="mc-deep"></div>
+                </div>
+                <div class="mode-popup-footer">Mode applies to the next question.</div>
+              </div>
+            </div>
+            <!-- Send Button -->
+            <button id="send-btn" onclick="sendQuestion()">
+              Send
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── Book Viewer Panel (iframe — zero external libraries) ── -->
+    <div id="book-panel">
+      <div id="book-panel-header">
+        <div>
+          <div id="book-panel-title">Book Viewer</div>
+          <div id="book-panel-subtitle"></div>
+        </div>
+        <button id="book-panel-close" onclick="closeBookPanel()">✕</button>
+      </div>
+
+      <div id="book-panel-nav">
+        <button class="nav-btn" id="pdf-prev" onclick="pdfPrev()" disabled>← Prev</button>
+        <input
+          type="number" id="pdf-page-input" min="1" value="1"
+          onchange="pdfJumpTo(parseInt(this.value))"
+          onkeydown="if(event.key==='Enter') pdfJumpTo(parseInt(this.value))"
+        />
+        <span id="pdf-page-total">of —</span>
+        <button class="nav-btn" id="pdf-next" onclick="pdfNext()" disabled>Next →</button>
+      </div>
+
+      <div id="book-panel-content" style="background: #0f1117; overflow: auto; position: relative;">
+        <div id="pdf-placeholder">Click a source chip below an answer to view the PDF page.</div>
+        <div id="pdf-loading"><div class="spinner"></div> Loading…</div>
+        <div id="pdf-canvas-wrapper" style="display: none; padding: 20px; text-aligm: center; min-height: 100%;">
+           <canvas id ="pdf-canvas" style= "max-width: 10%; box-shadow: 0 8px rgba(0,0,0,0.5); boder-radius: 4px;"></canvas>
+        <div id="pdf-loading"><div class="spinner"></div> Loading…</div>
+       </div>
+     </div>
+   </div>
+
+   </div>
+ </div>
+</div>
+
+<!-- ── New Chat Modal ─────────────────────────────────────────── -->
+<div id="modal-overlay">
+  <div id="modal">
+    <h2>Start New Chat Session</h2>
+    <div class="modal-section">
+      <label>Chat title (optional)</label>
+      <input type="text" id="new-chat-name" placeholder="e.g. Earth-Centric Phase discussion" style="width:100%;background:#1e2736;border:1px solid #2d3748;border-radius:8px;padding:9px 12px;color:#e2e8f0;font-size:13px;outline:none;font-family:inherit" />
+    </div>
+    <div class="modal-section">
+      <label>Select books</label>
+      <div class="book-select-list" id="book-select-list">
+        <div style="color:#475569;font-size:12px;padding:12px;">Loading books...</div>
+      </div>
+      <div class="error-text" id="book-error">Please select at least one document.</div>
+    </div>
+    <div class="modal-section">
+      <label>Default Mode</label>
+      <div class="mode-radio-group">
+        <div class="mode-radio selected" id="mr-fast" onclick="selectModalMode('fast')">
+          <span class="mode-radio-icon">⚡</span>
+          <span class="mode-radio-name">Fast</span>
+        </div>
+        <div class="mode-radio" id="mr-balanced" onclick="selectModalMode('balanced')">
+          <span class="mode-radio-icon">⚖</span>
+          <span class="mode-radio-name">Balanced</span>
+        </div>
+        <div class="mode-radio" id="mr-deep" onclick="selectModalMode('deep')">
+          <span class="mode-radio-icon">🧠</span>
+          <span class="mode-radio-name">Deep</span>
+        </div>
+      </div>
+    </div>
+    <div class="modal-actions">
+      <button class="btn-cancel" onclick="closeNewChatModal()">Cancel</button>
+      <button class="btn-primary" onclick="createChat()">Start Chat</button>
+    </div>
+  </div>
+</div>
+
+<script>
+
+// ═════════════════════════════════════════════════════════════════
+// CONFIG
+// ═════════════════════════════════════════════════════════════════
+const API = '';
+
+// ═════════════════════════════════════════════════════════════════
+// STATE
+// ═════════════════════════════════════════════════════════════════
+let token       = localstorage.getItem('kr_token') '';
+let currentUser = JSON.parse(localStorage.getItem('kr_ user') 'null');
+let activateChatId = null;
+let activateChatData = null;
+let currentMode = 'balanced';
+let modalMode   = 'balanced';
+let Streaming  = false;
+let popupOpen    = false;
+let bookViewer   = { bookId: null, pageNumber: null};
+
+-- ── Marked setup ─────────────────────────────────────────── 
+function renderMarkdown(text){
+ if (typeof marked !== 'umdefined'){
+   try { return marked.parse(text ''); } catch(e) {}
+ return escHtml(text '').replace(/\n/g, '<br>');
+}
+
+ ── Auth helpers ─────────────────────────────────────────── 
+fuction authHeaders() { return {'content-type': 'application/json', 'Authorization': ~Bearer ${token}~ }; }
+
+async function apiFetch(paths, opts = {}){
+ const res = await fetch(API + path, {
+     ..opts,
+  headers:{... authHeaders(), ...(opts.headers {}) }
+ });
+ if(res.status === 401) {logout(); return null;}
+ return res;
+}
+
+// ═════════════════════════════════════════════════════════════════
+// AUTH forms
+// ═════════════════════════════════════════════════════════════════
+function showAuthForm(tab) {
+  document.querrySelectorAll('.auth-tab'). forEach((t, i) => t.classList.toggle('active', i === (tab === 'Login' ? 0 : 1)));
+  document.getElementById('form-login').classList.toggle('active', tab === 'Login' );
+  document.getElementById('form-signup').classList.toggle('active', tab !== 'Login' );
+
+}
+
+async function doLogin() {
+  const email    = document.getElementById('login-email').value.trim();
+  const pass = document.getElementById('login-password').value;
+  const errEl = document.getElementById('login-error');
+  errEl.style.display = 'none';
+  if (!email || !pass) { showErr( errrEl, 'Enter email and password are required.'); return; }
+  try {
+    const res  = await fetch(API + '/auth/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email, password }) });
+    const data = await res.json();
+    if (!res.ok) { showLoginError(data.detail || 'Login failed.'); return; }
+    token = data.token;
+    currentUser = {Yser_id: data.user_id, name: data.name, email: data.email, role: data.role};
+    localStorage.setItem('kr_token', token);
+    localStorage.setItem('kr_token', JSON.stringify(currentUser));
+    bootApp();
+  } catch(e) { showErr(errEl,'Cannot connect to server. Is part B running?'); }
+}
+
+async function doSignup() {
+  const name = document.getElementById('signup-name').value.trim();
+  const email = document.getElementById('signup-email').value.trim();
+  const password = document.getElementById('signup-password').value;
+  const errEl = document.getElementById('signup-error');
+  errEl.style.display = 'none';
+  if (!name || !email || !password) { showErr(errEl, 'All fields required.'); return; }
+  try {
+    const res  = await fetch(API + '/auth/signup', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name, email, password }) });
+    const data = await res.json();
+    if (!res.ok) { showLoginError(data.detail || 'Signup failed.'); return; }
+    document.getElementById('login-email').value = email;
+    document.getElementById('login-password').value = pass;
+    showAuthForm('login');
+    await doLogin();
+  } catch(e) {showErr(errEl,'Network error'); }
+}
+
+function showErr(el,msg) {
+  el.textContent = msg; el.style.display = 'block';
+}
+
+function logout() {
+ localStorage.clear();
+ location.reload(); 
+}
+
+ //── boot ─────────────────────────────────────────── 
+function bootApp(){
+   document.getElementById('login-screen').style.display= 'none';
+   document.getElementById('app').style.display= 'flex';
+   if (currentUser) {
+      document.getElementById('user-role-display').textcontent = `${currentUser.name} . ${currentUser.role}`;
+   }
+   loadChats();
+   checkHealth();
+}
+
+if (token && currentUser) bootApp();
+
+ //── health check ─────────────────────────────────────────── 
+
+async function checkHealth() {
+  const el = document.getElementById('health-indicator');
+  if (!name || !email || !password) { showErr(errEl, 'All fields required.'); return; }
+  try {
+    const res = await apiFetch('/health');
+    if(!res) return;
+    const res = await res.json();
+    const data = Object.values(data).every(v => v.status === 'ok');
+    el.textContent = all ? ' All system ok' : ' Some services degraded';
+    el.style.color = all ? '#4ade80' : '#fbbf24';
+    
+  } catch { el.textContent = 'offline'; el.style.color = '#f87171'; }
+setInternal(checkHealth, 60000);
+
+// ═════════════════════════════════════════════════════════════════
+// CHAT LIST ── identical to old file
+// ═════════════════════════════════════════════════════════════════
+async function loadChats() {
+   const res = await apiFetch('/chats');
+   if(!res) return;
+   const chats = await res.json();
+   renderChatList(chats);
+}
+
+function renderChatList(chats) {
+  const el = document.getElementById('chat-list');
+  if (!chats.length) {
+    el.innerHTML = '<div style="color:#475569;font-size:12px;padding:16px;">No chats yet. Click + new to start.</div>';
+    return;
+  }
+  el.innerHTML = chats.map(c => `
+    <div class="chat-item ${c.chat_id === activateChatId ? 'activate' : ''}" onclick="openchat('${c.chat_id}')">
+      <span class="chat-item-icon">💬</span>
+      <div class="chat-item-body">
+        <div class="chat-item-title">${escHtml(c.title)}</div>
+        <div class="chat-item-meta">${c.book_ids.length} book${c.book_ids.length!==1?'s':''}.${c.default_mode}</div>
+      </div>
+      <button class="chat-item-delete" onclick="event.stopPropagation();deletechat('${c.chat_id}')" title="Delete">✕</button>
+    </div>
+  `).join('');
+}
+
+
+
+async function deleteChat(chatId) {
+  if(! confirm('delete this chat and all its meassages?'))return;
+  await apiFetch(1/chats/${chatId}`, { method: 'DELETE'});
+  if (activeChatId === chatId) {
+     activateChatId = null;
+     activateChatData = null;
+     resetChatView();
+     }
+     loadChats();
+}
+
+//-------------open chat--------------------
+
+async function openChat(chatId) {
+  activateChatId = chatId;
+    const res  = await apiFetch(`/chats/${chatId}`);
+    if (!res) return;
+    activateChatData = await res.json();
+    const data = await res.json()
+    currentMode = activateChatData.default_mode || 'balanced';
+    updateModeUI(currentMode);
+
+    document.getElementById('chat-title').textContent = activatechatData.title;
+    document.getElementById('chat-title').style.color = '#e2e8f0';
+    document.getElementById('chat-title').innerHTML;
+      (activatechatData.book_ids.map(b=> `<span class="book-chip-header">📄 ${bid}</span>`).join('');
+    const area = document.getElementById('/chats/${chatId}/messages`);
+    if (!mres) return;
+    const msgs = await mres.json();
+    const area = document.getElementById('messages-area');
+    aera.innerHTML='';
+    if (!msgs.length) {
+       area.innerHTML = '<div style="padding: 40px; colr:#475569; text-align:center; font-size: 13px">No message yet - ask your first question below.</div>;
+    } else{
+      msgs.forEach(m => appenfMessage(m.role, .content, m.source || 'balanced', false));
+    }
+    area.scrollTop = area.scrollHeight;
+    loadChats();
+}
+
+function resetChatView() {
+    document.getElementById('chat-title').textContent = 'Select or create a chat';
+    document.getElementById('chat-title').style.color = '#475569';
+    document.getElementById('book-chips-area').innerHTML = '';
+    document.getElementById('messages-area').innerHTML = `
+      <div id="padding: 40px; color: #477569; text-align: center: font-size: 13px"> Select a chat from the sidebar.</div><div class="icon">🛰</div><h3>ISRO Knowledge Assistant</h3>
+    
+}
+
+
+// ═════════════════════════════════════════════════════════════════
+// NEW CHAT MODAL
+// ═════════════════════════════════════════════════════════════════
+async function showNewChatModal() {
+  document.getElementById('modal-overlay').classList.add('show');
+  document.getElementById('book-error').style.display = 'none';
+  document.getElementById('nc-title').value = '';
+  modalMode = 'balanced';
+  selectModalMode('balanced');
+  const bsl  = document.getElementById('book-select-list');
+  bsl.innerHTML= '<div style="color:#475569;font-size:12px;padding:8px;">Loading..</div>'  
+  const res   = await fetch('/library`'),
+  const data  = await res.json();
+  const books = data.books || [];
+  if (!books.length) { bsl.innerHTML = '<div style="color:#475569;font-size:12px;padding:8px;">No books in library. upload via PartA  first.</div>'; return; }
+    return;
+  }
+   bsl.innerHTML = books.map(b => `
+     <label class="book-select-item" onclick="toggleBookSelect(this)">
+       <input type="checkbox" value="${escHtml(b.book_id)}" onclick="event.stopPropagation();toggleBookSelect(this.cloest('label'))"/>
+       <div>
+         <div class="book-select-name">${escHtml(b.title || b.book_id)}</div>
+         <div class="book-select-meta">${b.total_chunks || 0} chunks · ${b.total_pages || 0} pages</div>
+       </div>
+     </div>`).join('');
+}
+
+function toggleBookSelect(bookId) {
+  const item = document.querySelector('input[type=checkbox]');
+  const cb   = document.getElementById(`bsc-${bookId}`);
+  cb.checked = !cb.checked;
+  item.classList.toggle('checked', cb.checked);
+}
+
+function closeNewchatModal() {
+  document.getElementById('model-overlay').classList.remove('show');
+
+function selectModalMode(mode) {
+  modalMode = mode;
+  ['fast','balance','deep'].forEach(m=> {
+  document.getElementById(`me-${m}`).classList.toggle('selected',m === mode));
+}
+
+async function createChat() {
+  const title = document.getElementById('nc-title).value.trim() || null;
+  const bookIds = [...document.querrySelectorAll('#book-selct-list input:checked')].map(i => i.value);
+  const errEl = document.getElementById('modal-error);
+  errEl.style.display = 'none';
+  if (!bookIds.length) { errEl.textcontent = 'Select aaaat least one book.'; errEl.style.display='block'; retur
+  const res  = await fetch('/chats', { method: 'POST', body: JSON.stringify({ title,book_ids: bookIds, default_mode: modalMode, title: chatName || undefined }) });
+  if(!res) return;
+  const data = await res.json();
+  if (chat.detail){errEl.textContent = chat.detail; errrEl.style.display= 'block';  return; }
+  closeNewChatModal();
+  await loadchats();
+  await openchat(chat.chat_id);
+}
+
+
+// ═════════════════════════════════════════════════════════════════
+// MODE SELECTOR 
+// ═════════════════════════════════════════════════════════════════
+function toggleModePopup(e) {
+  e.stopPropagation();
+  const p   = document.getElementById('mode-popup');
+  p.style.display = p.style.display = 'block' ? 'none' : 'block;
+}
+document.addEventListener('click', () => {document.getElementById('mode-popup').style.display = 'none'; });
+
+function selectMode(mode) {
+  currentMode = mode;
+  updateModeUI(mode);
+  document.getElementById('mode-popup').style.display = 'none'; });
+  if (activeChatId){
+     apiFetch(`/chats/${activeChatId}`,{ method: 'PATCH', body: JSON.stringify({default_mode: mode }) });
+  }
+}
+
+
+function updateModeUI(mode) {
+  const icons  = { fast: '⚡', balanced: '⚖', deep: '🧠' };
+  const labels = { fast: 'Fast', balanced: 'Balanced', deep: 'Deep' };
+
+  document.getElementById('.mode-icon').textContent = icons[modes] || '⚖';
+  document.getElementById('.mode-label').textContent = labels[modes] || 'Balanced';
+  ['fast','balance','deep'].forEach(m=> {
+     document.getElementById(`mode-opt-${m}`).classList.toggle('selected',m === mode));
+     const mc = getElementById(`mc-${m}`);
+     mc.classList.toggle('on',m === mode);
+     mc.textContent = m === mode ? '✔️' : '';
+  });
+}
+
+
+// ═════════════════════════════════════════════════════════════════
+// MESSAGING ── identical to old file
+// ═════════════════════════════════════════════════════════════════
+function appendMessage(role, content, sources, mode, animate = true) {
+  const area  = document.getElementById('messages-area');
+  const emptyState = area.querySelector('#empty-state');
+  if (emptyState) emptyState.remove();
+  const row = document.createElement('div');
+  row.className = 'msg-row';
+  if (animate) row.style.animation = 'none';
+
+  if (role === 'user') {
+    row.innerHTML = `
+      <div class="msg-user">
+        <div class="msg-user-text">${escHtml(content)}</div>
+        <div class="msg-user-meta"><span class="mode-badge ${mode}">${modeLabel(mode)}</span></div>
+      </div>`;
+  } else {
+      const sourcesHtml  = buildSourcesHtml(sources) ;
+      const actionsHtml  = `
+	   <div class="msg-actions">
+	      <button class="regen-btn" onclick="toggleRegenMenu(this)">↺ Regenerate
+		<div class="regen-menu" style="display:none">
+		   <div class="regen-opt" onclick="regenWithMode(this,'fast')">⚡ Fast</div>
+    		   <div class="regen-opt" onclick="regenWithMode(this,'balanced')">⚖ Balanced</div>
+   	           <div class="regen-opt" onclick="regenWithMode(this,'deep')">🧠 Deep</div> 
+		</div>
+	      </button>
+           </div>`;
+	 row.innerHTML = `
+     		 <div class="msg-assistant">
+      	            <div class="msg-assistant-text>${renderMarkdown(content)}</div>
+          	     ${sourcesHtml}
+                     ${actionsHtml}
+                 </div>`;
+	}
+
+       area.appendChild(row);
+       area.scrollTop =  area.scrollHeight;
+       return row;
+   }
+
+function buildSourceChips(sources) {
+  if (!sources || !sources.length) return '';
+  const chips = sources.map((s,i) => {
+	 const pr = s.page_range || [0,0];
+	 const page = pr[0] ? `p.${pr[0]}${pr[1] && pr[1]!==pr[0] ? '-' + pr[1] : ''}` : '';
+	 const sec = (s.section_path || []).slice(-1)[0] || s.book_id || '';
+	 const score = s.rerank_score ? ` .score:${s.rerank_score}` : '';
+	 return `<span class="source-chip"  data-book="${escHtml(s.book_id||'')}" data-page="${pr[0]||1}"
+	     onclick="openBookPanel('${escHtml(s.book_id||'')}','${escHtml(s.chunk_id||'')}',${pr[0]||1})"
+	     title="${escHtml(s.book_id||'')} ${score}">
+	     📄 ${page ? page + ' . ' : ''}${escHtml(sec.substring(0,28))}
+	</span>`;
+   }).join('');
+   return`<div class="sources-row">${chips}</div>`;
+}
+ 
+
+
+// ═════════════════════════════════════════════════════════════════
+// SEND QUESTION ── identical to old file
+// ═════════════════════════════════════════════════════════════════
+async function sendQuestion(overrideMode) {
+  if (!activeChatId) { openNewChatModal(); return; }
+  if (Streaming) return; 
+
+  const ta = document.getElementById('question-input');
+  const q =  ta.value.trim();
+  if (!q) return;
+  ta.value = ''; autoResize(ta);
+  const mode     = overrideMode || currentMode;
+  appendMessage('user' , q, [], mode);
+  streaming = true;
+  document.getElementById('send-btn').disabled = true;
+
+  // Create assistant row with streaming bubble
+  const area      = document.getElementById('messages-area');  
+  const asstRow = document.createElement('div');
+  asstRow.className = 'msg-row';
+  const asstBubble = document.createElement('div');
+  asstBubble.className = 'msg-assisatant';
+  const textEl = document.createElement('div');
+  textEl.className = 'msg-assisatant-text streaming';
+  textEl.innerHTML = `<div class="status-msg"><div class="status-dot"></div><span>Thinking...</span></div>`;
+  asstBubble.appendChild(textEl);
+  asstRow.appendChild(asstBubble);
+  area.appendChild(asstRow);
+  area.scrollTop =  area.scrollHeight;
+
+  let fulltext = '';
+  let sources = [];
+
+  const res = await fetch(API + `/chats/${activeChatId}/ask`, { method: 'POST', headers: authHeaders(), body: JSON.stringify({ question: q, mode }) });
+  if (!res.ok || !res.body)throw new Error(`HTTP ${res.status}`);
+  const reader = res.body.getReader();
+  decoder = new TextDecoder();
+  let buf = '';
+  let firstToken = true;
+
+   while (true) {
+      const {done, value} = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      const lines = buf.split('\n');
+      buf = lines.pop();
+  for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        let evt;
+        try { evt = JSON.parse(line.slice(5).trim()); } catch { continue; }
+
+	if (evt.type === 'status') {
+           textEl.innerHTML = `<div class="status-msg"><div class="status-dot"></div><span>${evt.message)}</span></div>`;
+           textEl.classList.add('streaming');
+        } else if (evt.type === 'token') {
+          if (firstToken) { textEl.innerHTML = '';  textEl.classList.remove('streaming'); firstToken = false; }
+          fulltext += evt.content;
+          textEl.innerHTML = renderMarkdown(fullText);
+          area.scrollTop =  area.scrollHeight;
+        } else if (evt.type === 'done') {
+          sources = evt.sources || [];
+          textEl.innerHTML = renderMaekdown(fullText);
+
+
+          \\ add sources+ regen button
+           const sourcesEl= document.createElement('div');
+           sourcesEl.innerHTML = buildsourceHtml(sources);
+           const actionsEl= document.createElement('div');
+           actionsEl.innerHTML = `
+               <div class="msg-actions">
+	      <button class="regen-btn" onclick="toggleRegenMenu(this)">↺ Regenerate
+		<div class="regen-menu" style="display:none">
+		   <div class="regen-opt" onclick="regenWithMode(this,'fast')">⚡ Fast</div>
+    		   <div class="regen-opt" onclick="regenWithMode(this,'balanced')">⚖ Balanced</div>
+   	           <div class="regen-opt" onclick="regenWithMode(this,'deep')">🧠 Deep</div> 
+		</div>
+	      </button>
+           </div>`;
+
+	      asstBubble.appendChild(sourcesEl);
+	      asstBubble.appendChild(actionsEl);
+	      area.scrollTop =  area.scrollHeight;
+	      loadChats();
+        } else if (evt.type === 'error') {
+          textEl.innerHTML = `<span style="color:#f87171"> ${escHtml(evt.message)}</span>`; 
+	  textEl.classList.add('streaming');
+      }
+    }
+  } 
+  }catch(err) { textEl.innerHTML = `<span style="color:#f87171"> Request failed: ${escHtml(String(err))}</span>`; }
+  finally { Streaming = false; document.getElementById('send-btn').disabled = false;  }
+}
+
+// ═════════════════════════════════════════════════════════════════
+// REGENERATE
+// ═════════════════════════════════════════════════════════════════
+function toggleRegenMenu(btn) {
+  const menu = btn.querySelector('rgrn-menu')
+  men.style.display = menu.style.display === 'block' ? 'none' : 'block';
+}
+function regenWithMode(opt,mode){
+  opt.cloest('rgrn-menu').style.display = 'none'
+  const ta = document.getElentaryById('question-input');
+  // Get last user message
+  const userMsgs = document.querySelectionAll('.msg-user-text');
+  if (!userMsgs = length) return;
+  const lastQ = userMsgs[userMsgs.length - 1].textContent;ta.value = lastQ;
+  selectionMode(mode);
+  sendQuestion(mode);
+}
+
+// ═════════════════════════════════════════════════════════════════
+//  Suggestions
+// ═════════════════════════════════════════════════════════════════
+    
+ function useSuggestion(el) {
+   document.getElementById('question-input').value = el.
+   textContent.trim();
+   autoResize(document.getElementById('question-input'));
+   if (!activateChatId) openNewChatModel(); else sendQuestion()
+ }    
+
+
+
+// ═════════════════════════════════════════════════════════════════
+// BOOK VIEWER PANEL
+// ═════════════════════════════════════════════════════════════════
+
+
+let currentpdfDoc    = null;
+let isPageRendering  = null;
+let pageNumPending   = null;
+
+function _pdfUpdateNav() {
+  document.getElementById('pdf-prev').disabled = bookViewer.pageNumber<=1;
+  document.getElementById('pdf-next').disabled = bookViewer.pageNumber>=bookViewer.totalPages;
+  document.getElementById('pdf-page-input').value = bookViewer.pageNumber;  
+  document.getElementById('pdf-page-input').max= bookViewer.totalPages || 9999;
+  document.getElementById('pdf-page-total').textContent= bookViewer.totalPages ? `of ${bookViewer.totalPages}` : 'of-';
+  document.getElementById('book-pannel-subtitle').textContent= bookViewer.totalPages `Page ${bookViewer.totalPages} of ${bookViewer.totalPages}` : `Page ${bookViewer.pageNumber}`;
+}
+async function renderPage(num) {
+  if (!currentpdfDoc) return;
+  if (ispdfRendering) {
+    pageNumPending = num;
+    return;
+   }
+  try {
+    const page     = await currentpdfDoc.getPage(num);
+    const canvas = document.getElementById('pdf-canvas');
+    const ctx      = canvas.getContext('2d');
+    const viewport = page.getViewport({ scale: 1.5 });
+    const ctx      = canvas.getContext('2d');
+    canvas.height  = viewport.height;
+    canvas.width   = viewport.width;
+    };
+
+    await page.render(renderContext).promise;
+  } catch(error) {
+    console.log("Error rendering page:", error);
+    }
+  } finally {
+    isPageRendering = false;
+    if (pageNumPending !== null) {
+       renderPage(pageNumPending);
+       pageNumPending = null ;
+    }
+  }
+}
+
+async function openBookPage(bookI,pageNumber,msgId) {
+  document.querySelectorAll('.source-chip').forEach(c => c.classList.remove('active));
+  document.querySelectorAll(`#src-${msgId}.source-chip`).forEach(c =>
+    if(c.textcontent.includes(`Pg ${pageNumber}`)) c.classList.add('active));
+  });
+
+  const panel = document.getElementById('book-panel');
+  panel.classList.add('open');
+  document.getElementById('book-panel-title').textContent = bookID;
+  
+  const parsedPage = parseInt(pageNumber,10);
+  const safePageNum = isNaN(parsedPage) ? 1 : Math.max(1,parsedpage);
+  if (bookViewer.bookId === bookId && currentPdfDoc) {
+    bookViewer.pageNumber = safepageNum;
+     _pdfUpdateNav();
+     renderPage(safePageNum);
+     return;
+   }
+   document.getElementById('pdf-placeholder').style.display = 'none'; 
+   document.getElementById('pdf-loading').style.display = 'flex'; 
+   document.getElementById('pdf-canvas-wrapper').style.display = 'none'; 
+
+   try {
+     const url =`${API}/pdf/${encoderURICompent(bookId)}?token=${encoderURICompnent(token)}`;
+     const loadingTask = pdfjsLib.getDocument(url);
+     currentPdfDoc = await loadingTask.promise;
+
+     bookViewer.bookId = bookId;
+     bookViewer.totalPages = currentPdfDoc.numPages;
+     bookViewer.pageNumber = safePageNum;
+
+     document.getElementById('pdf-loading').style.display = 'none'; 
+     document.getElementById('pdf-canvas-wrapper').style.display = 'block';
+
+     _pdfUpdateNav();
+     renderPage(bookViewer.pageNumber);
+    } catch(error) {
+      document.getElementById('pdf-loading').style.display = 'none'; 
+      document.getElementById('pdf-placeholder').style.display = 'flex'; 
+      document.getElementById('pdf-placeholder').textContent= 'failed to load document'; 
+       console.error('PDF load error:', error);
+
+     }
+} 
+
+function pdfPrev() {
+  if (bookViewer.pageNumber<=1;) return;
+  bookViewer.pageNumber--;
+  _pdfUpdateNav();
+  renderPage(bookViewer.pageNumber);
+}
+function pdfNext() {
+  if (bookViewer.totalPages && bookViewer.pageNumber >= bookViewer.totalPages) return;
+  bookViewer.pageNumber++;
+  _pdfUpdateNav();
+  renderPage(bookViewer.pageNumber);
+}
+function pdfJumpTo(n) {
+  if (!currentpdfDoc) return;
+  const parsedN = parseInt( n , 10);
+  if (isNaN(parsedN))return;
+  const page = Math.max(1,Math.min(bookViewer.totalpages || 99999, parsedN));
+  bookViewer.pageNumber = page;
+  _pdfUpdateNav();
+  renderpage(page);
+}
+
+function closeBookPanel() {
+  document.getElementById('book-panel').classList.remove('open');
+  document.querySelectorAll('.source-chip').forEach(c => c.classList.remove('active'));
+
+  if(currentPdfDoc){
+    currentPdfDoc.destory();
+    currentPdfDoc= null;
+
+
+  const canvas = document.getElementById('pdf-canvas');
+  if(canvas) {
+     const ctx = canvas.width, canvas.height);
+  }
+
+  document.getElementById('pdf-canvas-wrapper').style.display = 'none'; 
+  document.getElementById('pdf-placeholder').style.display = 'flex'; 
+  document.getElementById('pdf-placeholder').textContent= 'Click a sourcr chip below an answer to view the PDF page.';
+  bookViewer = { bookId: null, pageNumber:1, totalPages:0 };
+}
+
+
+// ═════════════════════════════════════════════════════════════════
+// UTILITIES
+// ═════════════════════════════════════════════════════════════════
+
+function handleKey(e) {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    sendQuestion();
+}
+function autoResize(el) {
+  el.style.height = 'auto';
+  el.style.height = Math.min(el.scrollHeight, 160) + 'px';
+}
+function escHtml(str) {
+  return String(str)
+    .replace(/&/g,'&amp;')
+    .replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;')
+    .replace(/"/g,'&quot;');
+}
+function modeLabel(mode) {
+  return { fast: '⚡ Fast', balanced: '⚖ Balanced', deep: '🧠 Deep' }[mode] || mode;
+}
+</script>
+</body>
+</html>
