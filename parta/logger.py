@@ -31,21 +31,21 @@ if not logger.handlers:
 
 import atexit
 
-_private_stats = {}
+_aggregated_stats = {}
 
-def _log_private_stats():
-    if not _private_stats:
+def _log_aggregated_stats():
+    if not _aggregated_stats:
         return
-    logger.info("=== Private Functions Total Time ===")
-    for func_name, stats in _private_stats.items():
+    logger.info("=== Aggregated Fast/Internal Functions Total Time ===")
+    for func_name, stats in _aggregated_stats.items():
         logger.info(f"Function {func_name} called {stats['count']} times, total time: {stats['total_time']:.4f}s")
-    logger.info("====================================")
+    logger.info("=====================================================")
 
-atexit.register(_log_private_stats)
+atexit.register(_log_aggregated_stats)
 
 def time_it(func: Callable) -> Callable:
     """Decorator to measure execution time of a synchronous function."""
-    is_private = func.__name__.startswith('_')
+    is_internal = func.__name__.startswith('_') or (func.__module__ and 'transformers_modules' in func.__module__)
 
     @functools.wraps(func)
     def wrapper(*args, **kwargs) -> Any:
@@ -54,12 +54,12 @@ def time_it(func: Callable) -> Callable:
         end_time = time.perf_counter()
         elapsed = end_time - start_time
         
-        if is_private:
+        if is_internal or elapsed < 0.05:
             name = f"{func.__module__}.{func.__name__}"
-            if name not in _private_stats:
-                _private_stats[name] = {'count': 0, 'total_time': 0.0}
-            _private_stats[name]['count'] += 1
-            _private_stats[name]['total_time'] += elapsed
+            if name not in _aggregated_stats:
+                _aggregated_stats[name] = {'count': 0, 'total_time': 0.0}
+            _aggregated_stats[name]['count'] += 1
+            _aggregated_stats[name]['total_time'] += elapsed
         else:
             logger.info(f"Function {func.__module__}.{func.__name__} took {elapsed:.4f}s")
         return result
@@ -67,7 +67,7 @@ def time_it(func: Callable) -> Callable:
 
 def async_time_it(func: Callable) -> Callable:
     """Decorator to measure execution time of an asynchronous function."""
-    is_private = func.__name__.startswith('_')
+    is_internal = func.__name__.startswith('_') or (func.__module__ and 'transformers_modules' in func.__module__)
 
     @functools.wraps(func)
     async def wrapper(*args, **kwargs) -> Any:
@@ -76,12 +76,12 @@ def async_time_it(func: Callable) -> Callable:
         end_time = time.perf_counter()
         elapsed = end_time - start_time
         
-        if is_private:
+        if is_internal or elapsed < 0.05:
             name = f"{func.__module__}.{func.__name__}"
-            if name not in _private_stats:
-                _private_stats[name] = {'count': 0, 'total_time': 0.0}
-            _private_stats[name]['count'] += 1
-            _private_stats[name]['total_time'] += elapsed
+            if name not in _aggregated_stats:
+                _aggregated_stats[name] = {'count': 0, 'total_time': 0.0}
+            _aggregated_stats[name]['count'] += 1
+            _aggregated_stats[name]['total_time'] += elapsed
         else:
             logger.info(f"Async Function {func.__module__}.{func.__name__} took {elapsed:.4f}s")
         return result
