@@ -32,7 +32,7 @@ class LoginBody(BaseModel):
 @time_it
 def users_col():
     col = get_mongo()[MONGO_DB]["users"]
-    col.craete_index("email", unique=True)
+    col.create_index("email", unique=True)
     return col
 
 @router.post("/signup")
@@ -53,7 +53,7 @@ def signup(body: SignupBody):
     user_id = str(uuid.uuid4())
 
     try:
-        users_col.insert_one(
+        users_col().insert_one(
             {
                 "user_id": user_id,
                 "name": name,
@@ -74,7 +74,7 @@ def signup(body: SignupBody):
 def login(body: LoginBody):
     email = body.email.strip().lower()
     password = body.password
-    user = users_col.find_one({"email":email})
+    user = users_col().find_one({"email":email})
 
     if not user:
         raise HTTPException(401, "Invalid email or password.")

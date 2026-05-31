@@ -77,6 +77,7 @@ Called by pipeline_controller.py:
 """
 
 import re
+from parta.logger import time_it, async_time_it
 import json
 import uuid
 from pathlib import Path
@@ -86,6 +87,7 @@ from pathlib import Path
 # NLTK SETUP — offline, uses portable/nltk_data if present
 # ─────────────────────────────────────────────────────────────────────────────
 
+@time_it
 def _load_nltk(base_dir: Path):
     """
     Loads NLTK with offline data path if available.
@@ -119,6 +121,7 @@ def _load_nltk(base_dir: Path):
             return _regex_sent_tokenize
 
 
+@time_it
 def _regex_sent_tokenize(text: str) -> list:
     """
     Simple regex-based sentence splitter.
@@ -146,6 +149,7 @@ _NOISE_PATTERNS = [
     re.compile(r"^\s*(back|next|index|home|print)\s*$", re.I),  # UI noise
 ]
 
+@time_it
 def _is_quality_sentence(sentence: str) -> bool:
     """
     Returns True if the sentence is worth embedding as a proposition.
@@ -186,6 +190,7 @@ def _is_quality_sentence(sentence: str) -> bool:
 # PROPOSITION ID — stable, deterministic
 # ─────────────────────────────────────────────────────────────────────────────
 
+@time_it
 def _make_proposition_id(book_id: str, parent_chunk_id: str, index: int) -> str:
     """
     Deterministic UUID for a proposition.
@@ -200,6 +205,7 @@ def _make_proposition_id(book_id: str, parent_chunk_id: str, index: int) -> str:
 # TEXT PROPOSITION EXTRACTION
 # ─────────────────────────────────────────────────────────────────────────────
 
+@time_it
 def _extract_text_propositions(
     chunk:         dict,
     sent_tokenize, # the tokenizer function
@@ -272,6 +278,7 @@ _UNIT_HEADERS = {
 }
 
 
+@time_it
 def _detect_table_pattern(headers: list) -> str:
     """
     Looks at table headers and returns the generation pattern to use.
@@ -293,6 +300,7 @@ def _detect_table_pattern(headers: list) -> str:
     return "generic"
 
 
+@time_it
 def _row_to_sentence_spec(
     row:          dict,
     headers:      list,
@@ -346,6 +354,7 @@ def _row_to_sentence_spec(
         return f"{subject} is {value}."
 
 
+@time_it
 def _row_to_sentence_generic(row: dict, headers: list) -> str:
     """
     Generates a generic key-value sentence from a table row.
@@ -366,6 +375,7 @@ def _row_to_sentence_generic(row: dict, headers: list) -> str:
     return ""
 
 
+@time_it
 def _extract_table_propositions(
     chunk:      dict,
     prop_index: int,
@@ -447,6 +457,7 @@ def _extract_table_propositions(
 # PUBLIC ENTRY POINT — called by pipeline_controller.py
 # ─────────────────────────────────────────────────────────────────────────────
 
+@time_it
 def run_propositions(
     book_id:           str,
     json_path:         str,

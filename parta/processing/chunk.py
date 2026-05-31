@@ -48,6 +48,7 @@ Called by pipeline_controller.py:
 """
 
 import re
+from parta.logger import time_it, async_time_it
 import json
 import uuid
 from pathlib import Path
@@ -62,6 +63,7 @@ from typing import Optional
 _PAGE_MARKER_RE = re.compile(r"##\s*---\s*PAGE\s+(\d+)\s*---")
 
 
+@time_it
 def _make_chunk_id(book_id: str, section_path: list, index: int) -> str:
     """
     Stable UUID derived from book + section path + index.
@@ -72,6 +74,7 @@ def _make_chunk_id(book_id: str, section_path: list, index: int) -> str:
     return str(uuid.uuid5(uuid.NAMESPACE_DNS, key))
 
 
+@time_it
 def _last_page_in_content(content_raw: str) -> Optional[int]:
     """
     Finds the LAST page marker in a chunk's raw content.
@@ -82,6 +85,7 @@ def _last_page_in_content(content_raw: str) -> Optional[int]:
     return max(found) if found else None
 
 
+@time_it
 def _clean_content(text: str) -> str:
     """
     Light cleaning of chunk content.
@@ -96,6 +100,7 @@ def _clean_content(text: str) -> str:
     return text.strip()
 
 
+@time_it
 def _is_table_line(line: str) -> bool:
     """
     Returns True if a line is part of a markdown pipe table.
@@ -104,6 +109,7 @@ def _is_table_line(line: str) -> bool:
     return stripped.startswith("|") or stripped.count("|") >= 2
 
 
+@time_it
 def _split_text_and_tables(content: str) -> list:
     """
     Given the raw text content of one header-delimited section,
@@ -154,6 +160,7 @@ def _split_text_and_tables(content: str) -> list:
     return blocks
 
 
+@time_it
 def _parse_header_line(line: str) -> Optional[tuple]:
     """
     Checks if a line is a markdown section header.
@@ -181,6 +188,7 @@ def _parse_header_line(line: str) -> Optional[tuple]:
 # MAIN PARSER — page tracking fix is here
 # ─────────────────────────────────────────────────────────────────────────────
 
+@time_it
 def _parse_markdown_into_chunks(
     markdown:  str,
     book_id:   str,
@@ -341,6 +349,7 @@ def _parse_markdown_into_chunks(
 # PUBLIC ENTRY POINT — called by pipeline_controller.py
 # ─────────────────────────────────────────────────────────────────────────────
 
+@time_it
 def run_chunking(
     book_id:           str,
     base_dir:          str,

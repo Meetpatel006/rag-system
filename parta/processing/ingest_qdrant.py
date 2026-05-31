@@ -60,6 +60,7 @@ Called by pipeline_controller.py:
 """
 
 import json
+from parta.logger import time_it, async_time_it
 import time
 import uuid
 import logging
@@ -71,9 +72,10 @@ logging.getLogger("transformers").setLevel(logging.ERROR)
 # ─────────────────────────────────────────────────────────────────────────────
 # HARDCODED CONFIGURATION — no environment variables
 # ─────────────────────────────────────────────────────────────────────────────
-QDRANT_URL           = "http://localhost:6333"
-COLLECTION_PROPS     = "propositions"   # atomic sentence vectors
-COLLECTION_SECTIONS  = "sections"       # full section chunk vectors
+QDRANT_URL           = "https://ec85c2a8-9447-4153-852a-3ddb9f369324.australia-southeast1-0.gcp.cloud.qdrant.io"
+QDRANT_API_KEY       = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJhY2Nlc3MiOiJtIiwic3ViamVjdCI6ImFwaS1rZXk6YzE4OTkzYWYtNTJiNi00NjkwLWFkMWUtMjRjMzNiMmYyYWE1In0.eW0QstWU__d8fxEvi09i4YPLCPflkwjzKZNLPFpElGE"
+COLLECTION_PROPS     = "RAG_PROPOSITIons"
+COLLECTION_SECTIONS  = "RAG_sections"
 EMBEDDING_DIM        = 768             # Nomic embed-text-v1.5 output size
 BATCH_SIZE           = 64              # points per upsert call
 
@@ -87,6 +89,7 @@ _embed_model = None
 _q_client    = None
 
 
+@time_it
 def _get_embed_model(base_dir: str):
     """Loads Nomic model once and caches it."""
     global _embed_model
@@ -112,6 +115,7 @@ def _get_embed_model(base_dir: str):
     return _embed_model
 
 
+@time_it
 def _get_qdrant_client():
     """Creates Qdrant client once and caches it."""
     global _q_client
@@ -119,7 +123,7 @@ def _get_qdrant_client():
         return _q_client
 
     from qdrant_client import QdrantClient
-    _q_client = QdrantClient(url=QDRANT_URL)
+    _q_client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
     print(f"[QDRANT] Connected to Qdrant at {QDRANT_URL}")
     return _q_client
 
@@ -128,6 +132,7 @@ def _get_qdrant_client():
 # COLLECTION SETUP
 # ─────────────────────────────────────────────────────────────────────────────
 
+@time_it
 def _ensure_collection(client, name: str):
     """
     Creates collection if it does not exist.
@@ -154,6 +159,7 @@ def _ensure_collection(client, name: str):
     _safe_create_index(client, name, "page",       "integer")
 
 
+@time_it
 def _safe_create_index(client, collection: str, field: str, schema: str):
     """Creates a payload index, silently ignores if it already exists."""
     from qdrant_client import models as qm
@@ -176,6 +182,7 @@ def _safe_create_index(client, collection: str, field: str, schema: str):
 # STABLE POINT IDS
 # ─────────────────────────────────────────────────────────────────────────────
 
+@time_it
 def _point_id(book_id: str, collection: str, item_id: str) -> str:
     """
     Deterministic UUID for a Qdrant point.
@@ -189,6 +196,7 @@ def _point_id(book_id: str, collection: str, item_id: str) -> str:
 # BATCH EMBEDDING HELPER
 # ─────────────────────────────────────────────────────────────────────────────
 
+@time_it
 def _embed_batch(model, texts: List[str]) -> List[List[float]]:
     """
     Embeds a list of texts with the Nomic prefix.
@@ -204,6 +212,7 @@ def _embed_batch(model, texts: List[str]) -> List[List[float]]:
 # COLLECTION 1 — PROPOSITIONS
 # ─────────────────────────────────────────────────────────────────────────────
 
+@time_it
 def _ingest_propositions(
     propositions: List[dict],
     model,
@@ -289,6 +298,7 @@ def _ingest_propositions(
 # COLLECTION 2 — SECTIONS
 # ─────────────────────────────────────────────────────────────────────────────
 
+@time_it
 def _ingest_sections(
     chunks:   List[dict],
     model,
@@ -390,6 +400,7 @@ def _ingest_sections(
 # CONFIDENCE REPORT COMPATIBILITY OUTPUT
 # ─────────────────────────────────────────────────────────────────────────────
 
+@time_it
 def _write_chunks_log(
     chunks:    List[dict],
     book_id:   str,
@@ -460,6 +471,7 @@ def _write_chunks_log(
 # PUBLIC ENTRY POINT — called by pipeline_controller.py
 # ─────────────────────────────────────────────────────────────────────────────
 
+@time_it
 def run_qdrant_ingestion(
     book_id:           str,
     ready_path:        str,

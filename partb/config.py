@@ -32,9 +32,8 @@ JWT_ALGORITHM = "HS256"
 JWT_EXPIRE_HOURS =8
 
 # LiteLLM OpenAI-compatible proxy (Master)
-# LITELLM_BASE_URL = "http://127.0.0.1:4000/v1"
-# LITELLM_API_KEY = ""
-LITELLM_BASE_URL = "https://api.mistral.ai/v1"
+LITELLM_BASE_URL = "http://127.0.0.1:4000/v1"
+# LITELLM_BASE_URL = "https://api.mistral.ai/v1"
 LITELLM_API_KEY = "yU15nPBcRPH0myzxjlZBQATOvDBRSgQB"
 
 # If "1", stream from local Ollama /api/generate instead (dev fallback)

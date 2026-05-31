@@ -54,6 +54,7 @@ Called by pipeline_controller.py:
 """
 
 import re
+from parta.logger import time_it, async_time_it
 import json
 import time
 import uuid
@@ -71,10 +72,14 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 # ─────────────────────────────────────────────────────────────────────────────
 # HARDCODED CONFIGURATION — no environment variables per project rules
 # ─────────────────────────────────────────────────────────────────────────────
-NEO4J_URI  = "bolt://localhost:7687"
-NEO4J_AUTH = ("neo4j", "sac@1234")
+NEO4J_URI  = "neo4j+s://95a8070a.databases.neo4j.io"
+NEO4J_AUTH = ("95a8070a", "39TVuQIDdPNbNnVNgiWGzi_SVl17V-8hetw54nLyI0M")
 
-# GLiNER entity labels — same as original neo4j_worker.py
+import json
+import collections
+from pathlib import Path
+
+# GLiNER entity labels — dynamically loaded
 ENTITY_LABELS = [
     "equipment",
     "metric",
@@ -84,6 +89,21 @@ ENTITY_LABELS = [
     "concept",
     "person",
 ]
+
+_json_path = Path(__file__).resolve().parent.parent.parent / "partb" / "unie_synthetic.json"
+if _json_path.exists():
+    try:
+        with open(_json_path, 'r', encoding='utf-8') as f:
+            _data = json.load(f)
+        _all_labels = [
+            item[2] for record in _data 
+            for item in record.get('ner', []) 
+            if '<>' not in item[2] and item[2].lower() != "match"
+        ]
+        _counter = collections.Counter(_all_labels)
+        ENTITY_LABELS = [k for k, v in _counter.most_common(30)]
+    except Exception as e:
+        print(f"Warning: Failed to load labels from JSON: {e}")
 
 # GLiNER confidence threshold
 GLINER_THRESHOLD = 0.45
@@ -135,6 +155,7 @@ SPEC_SUBJECT_IGNORE = {
 }
 
 
+@time_it
 def _extract_specifications(text: str) -> List[Dict]:
     """
     Runs the spec regex on a text block.
@@ -189,6 +210,7 @@ def _extract_specifications(text: str) -> List[Dict]:
 # GLINER SETUP — reused directly from neo4j_worker.py
 # ─────────────────────────────────────────────────────────────────────────────
 
+@time_it
 def _load_gliner(base_dir: Path):
     """
     Loads GLiNER from portable/gliner/ — same logic as original worker.
@@ -212,6 +234,7 @@ def _load_gliner(base_dir: Path):
     return model
 
 
+@time_it
 def _load_nltk(base_dir: Path):
     """
     Loads NLTK sent_tokenize with offline data path.
@@ -239,16 +262,19 @@ def _load_nltk(base_dir: Path):
             return _regex_sent_tokenize
 
 
+@time_it
 def _regex_sent_tokenize(text: str) -> List[str]:
     sentences = re.split(r"(?<=[.!?])\s+(?=[A-Z])", text)
     return [s.strip() for s in sentences if s.strip()]
 
 
+@time_it
 def _normalize_entity_name(name: str) -> str:
     """Lowercase and collapse whitespace — same as original worker."""
     return " ".join(name.strip().lower().split())
 
 
+@time_it
 def _run_gliner_on_text(
     gliner_model,
     text: str,
@@ -320,6 +346,7 @@ def _run_gliner_on_text(
 # LAYER 1 — DOCUMENT HIERARCHY
 # ─────────────────────────────────────────────────────────────────────────────
 
+@time_it
 def _build_hierarchy(
     session,
     chunks:     List[dict],
@@ -442,6 +469,7 @@ def _build_hierarchy(
 # LAYER 2 — SPECIFICATION NODES
 # ─────────────────────────────────────────────────────────────────────────────
 
+@time_it
 def _write_specifications(session, specs: List[Dict], section_name: str, book_id: str):
     """
     Writes Spec nodes and HAS_SPECIFICATION edges for one chunk's specs.
@@ -480,6 +508,7 @@ def _write_specifications(session, specs: List[Dict], section_name: str, book_id
 # LAYER 3 — ENTITY-SECTION LINKS
 # ─────────────────────────────────────────────────────────────────────────────
 
+@time_it
 def _write_entity_section_links(
     session,
     entities:     List[Dict],
@@ -520,6 +549,7 @@ def _write_entity_section_links(
 # LAYER 4 — SENTENCE CO-OCCURRENCE (accumulated in memory, written in batch)
 # ─────────────────────────────────────────────────────────────────────────────
 
+@time_it
 def _write_cooccurrence_batch(
     session,
     cooccurrence: Dict[Tuple, Dict],
@@ -565,6 +595,7 @@ def _write_cooccurrence_batch(
 # LAYER 5 — TABLE NODES
 # ─────────────────────────────────────────────────────────────────────────────
 
+@time_it
 def _write_table_nodes(
     session,
     chunk:   dict,
@@ -671,6 +702,7 @@ def _write_table_nodes(
 # MAIN PROCESSING LOOP
 # ─────────────────────────────────────────────────────────────────────────────
 
+@time_it
 def _process_chunks(
     session,
     chunks:       List[dict],
@@ -785,6 +817,7 @@ def _process_chunks(
 # PUBLIC ENTRY POINT — called by pipeline_controller.py
 # ─────────────────────────────────────────────────────────────────────────────
 
+@time_it
 def run_neo4j_ingestion(
     book_id:           str,
     ready_path:        str,

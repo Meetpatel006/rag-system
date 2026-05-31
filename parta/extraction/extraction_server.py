@@ -16,6 +16,11 @@ Run with:
 """
 
 import uuid
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
+
+from parta.logger import time_it, async_time_it
 import time
 import threading
 import shutil
@@ -44,6 +49,7 @@ extraction_lock = threading.Lock()
 # START EXTRACTION — called by pipeline_controller
 # ─────────────────────────────────────────────────────────────────────────────
 @app.post("/start_extraction")
+@time_it
 def start_extraction(payload: dict):
     """
     Splits PDF into fixed-size chunk files on disk.
@@ -139,6 +145,7 @@ def start_extraction(payload: dict):
 # GET JOB — worker pulls when free
 # ─────────────────────────────────────────────────────────────────────────────
 @app.get("/get_job")
+@time_it
 def get_job(worker_id: str = "unknown"):
     """
     Workers call this when free. Returns job metadata.
@@ -216,6 +223,7 @@ def get_job(worker_id: str = "unknown"):
 # CHUNK BINARY — worker downloads raw PDF bytes
 # ─────────────────────────────────────────────────────────────────────────────
 @app.get("/chunk/{job_id}")
+@time_it
 def get_chunk_binary(job_id: str):
     """
     Returns raw PDF bytes for a chunk (application/octet-stream).
@@ -245,6 +253,7 @@ def get_chunk_binary(job_id: str):
 # SUBMIT RESULT — worker returns extracted markdown
 # ─────────────────────────────────────────────────────────────────────────────
 @app.post("/submit_result")
+@time_it
 def submit_result(payload: dict):
     """
     Worker posts result after processing a chunk.
@@ -300,6 +309,7 @@ def submit_result(payload: dict):
 # STATUS — polled by pipeline_controller
 # ─────────────────────────────────────────────────────────────────────────────
 @app.get("/extraction_status/{book_id}")
+@time_it
 def extraction_status(book_id: str):
     with extraction_lock:
         state = extractions.get(book_id)
@@ -332,6 +342,7 @@ def extraction_status(book_id: str):
 # GET RESULT — pipeline_controller fetches assembled markdown
 # ─────────────────────────────────────────────────────────────────────────────
 @app.get("/get_result/{book_id}")
+@time_it
 def get_result(book_id: str):
     with extraction_lock:
         state = extractions.get(book_id)
@@ -364,6 +375,7 @@ def get_result(book_id: str):
 # HEALTH
 # ─────────────────────────────────────────────────────────────────────────────
 @app.get("/health")
+@time_it
 def health():
     with extraction_lock:
         active = {
@@ -377,6 +389,7 @@ def health():
 # ─────────────────────────────────────────────────────────────────────────────
 # HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
+@time_it
 def _check_finished(book_id: str, state: dict):
     done = state["completed"] + state["failed"]
     if done >= state["total"] and not state["is_finished"]:
@@ -391,6 +404,7 @@ def _check_finished(book_id: str, state: dict):
         ).start()
 
 
+@time_it
 def _cleanup_after_delay(chunk_dir: str):
     time.sleep(CLEANUP_DELAY_SEC)
     shutil.rmtree(chunk_dir, ignore_errors=True)

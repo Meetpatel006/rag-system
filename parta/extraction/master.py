@@ -15,6 +15,7 @@ inside extraction_server.py — this file has no worker logic.
 """
 
 import requests
+from parta.logger import time_it, async_time_it
 import time
 from pathlib import Path
 
@@ -24,6 +25,7 @@ EXTRACTION_SERVER_URL = "http://localhost:8004"
 POLL_INTERVAL_SEC     = 5
 
 
+@time_it
 def run_extraction(
     book_id:           str,
     pdf_path:          str,

@@ -27,6 +27,11 @@ Run with: uvicorn main_api:app --host 0.0.0.0 --port 8000
 """
 
 import os
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from parta.logger import time_it, async_time_it
 import re
 import uuid
 import queue
@@ -55,7 +60,7 @@ BASE_DIR     = Path(__file__).resolve().parent
 DATA_RAW_DIR = BASE_DIR / "data" / "raw"
 DATA_RAW_DIR.mkdir(parents=True, exist_ok=True)
 
-MONGO_URI        = "mongodb://localhost:27017"
+MONGO_URI        = "mongodb+srv://redrepter:ncq4fIo18UK948dV@krutrim.li124fs.mongodb.net/?appName=krutrim"
 MONGO_DB_NAME    = "rag_system"
 
 JWT_SECRET       = "ISRO_RAG_SECRET_CHANGE_IN_PROD"
@@ -109,6 +114,7 @@ if frontend_dir.exists():
 # JWT helpers
 # ---------------------------------------------------------------------------
 
+@time_it
 def create_token(user_id: str, name: str, email: str) -> str:
     payload = {
         "user_id": user_id,
@@ -119,6 +125,7 @@ def create_token(user_id: str, name: str, email: str) -> str:
     return pyjwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
 
 
+@time_it
 def verify_token(request: Request) -> dict:
     auth = request.headers.get("Authorization", "")
     if not auth.startswith("Bearer "):
@@ -138,6 +145,7 @@ def verify_token(request: Request) -> dict:
 pipeline_queue: queue.Queue = queue.Queue()
 
 
+@time_it
 def queue_worker():
     """
     Background thread — picks jobs one at a time.
@@ -173,6 +181,7 @@ print("[MAIN API] ✅ Background queue worker started.")
 # ---------------------------------------------------------------------------
 
 @app.get("/", response_class=HTMLResponse)
+@time_it
 def serve_frontend():
     html_file = BASE_DIR / "frontend" / "index.html"
     if html_file.exists():
@@ -185,6 +194,7 @@ def serve_frontend():
 # ---------------------------------------------------------------------------
 
 @app.post("/auth/signup")
+@time_it
 def signup(body: dict):
     name     = body.get("name", "").strip()
     email    = body.get("email", "").strip().lower()
@@ -216,6 +226,7 @@ def signup(body: dict):
 
 
 @app.post("/auth/login")
+@time_it
 def login(body: dict):
     email    = body.get("email", "").strip().lower()
     password = body.get("password", "")
@@ -240,6 +251,7 @@ def login(body: dict):
 # ---------------------------------------------------------------------------
 
 @app.get("/library/check")
+@time_it
 def check_book_id(book_id: str, user=Depends(verify_token)):
     exists  = library_col.find_one({"book_id": book_id}) is not None
     running = jobs_col.find_one(
@@ -249,6 +261,7 @@ def check_book_id(book_id: str, user=Depends(verify_token)):
 
 
 @app.post("/upload_book")
+@async_time_it
 async def upload_book(
     book_id: str        = Form(...),
     file:    UploadFile = File(...),
@@ -322,6 +335,7 @@ async def upload_book(
 # ---------------------------------------------------------------------------
 
 @app.get("/progress/{job_id}")
+@async_time_it
 async def progress_stream(job_id: str, request: Request):
     """Server-Sent Events stream. Polls MongoDB every 2 s until terminal status."""
 
@@ -373,6 +387,7 @@ async def progress_stream(job_id: str, request: Request):
 # ---------------------------------------------------------------------------
 
 @app.get("/pending_jobs")
+@time_it
 def pending_jobs(user=Depends(verify_token)):
     """
     Returns jobs in resumable states (extraction_done or ingestion_failed).
@@ -388,6 +403,7 @@ def pending_jobs(user=Depends(verify_token)):
 
 
 @app.post("/resume/{job_id}")
+@time_it
 def resume_job(job_id: str, user=Depends(verify_token)):
     """
     Re-queues Phase 2 for a job in a resumable state.
@@ -516,12 +532,14 @@ def resume_job(job_id: str, user=Depends(verify_token)):
 # ---------------------------------------------------------------------------
 
 @app.get("/library")
+@time_it
 def get_library(user=Depends(verify_token)):
     books = list(library_col.find({"status": "ready"}, {"_id": 0}))
     return {"books": books, "count": len(books)}
 
 
 @app.get("/jobs/{job_id}")
+@time_it
 def get_job_status(job_id: str, user=Depends(verify_token)):
     doc = jobs_col.find_one({"job_id": job_id}, {"_id": 0, "password": 0})
     if not doc:
@@ -534,6 +552,7 @@ def get_job_status(job_id: str, user=Depends(verify_token)):
 # ---------------------------------------------------------------------------
 
 @app.get("/health")
+@time_it
 def health():
     return {
         "status":     "ok",

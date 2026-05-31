@@ -53,6 +53,7 @@ Called by pipeline_controller.py after run_triple_rep():
 """
 
 from __future__ import annotations
+from parta.logger import time_it, async_time_it
 
 import json
 import re
@@ -70,6 +71,7 @@ from typing import Optional
 _PAGE_MARKER_RE = re.compile(r"##\s*---\s*PAGE\s+(\d+)\s*---")
 
 
+@time_it
 def _split_md_by_pages(markdown: str) -> dict[int, str]:
     """
     Splits the .md file by Docling page markers.
@@ -111,12 +113,14 @@ def _split_md_by_pages(markdown: str) -> dict[int, str]:
 # TABLE DETECTION IN RAW PAGE TEXT
 # ─────────────────────────────────────────────────────────────────────────────
 
+@time_it
 def _is_table_line(line: str) -> bool:
     """Returns True if a line is part of a pipe table."""
     stripped = line.strip()
     return stripped.startswith("|") or stripped.count("|") >= 2
 
 
+@time_it
 def _is_separator_row(line: str) -> bool:
     """Returns True if a line is a table separator (|---|---|)."""
     stripped = line.strip()
@@ -125,6 +129,7 @@ def _is_separator_row(line: str) -> bool:
     return bool(re.match(r"^[\|\-\:\s]+$", stripped))
 
 
+@time_it
 def _extract_pipe_tables(page_text: str) -> list[dict]:
     """
     Finds all pipe table blocks in a page's raw text.
@@ -183,6 +188,7 @@ def _extract_pipe_tables(page_text: str) -> list[dict]:
     return tables
 
 
+@time_it
 def _parse_pipe_header(header_line: str) -> list[str]:
     """
     Parses the header row of a pipe table into a list of column names.
@@ -211,6 +217,7 @@ _VALUE_HEADERS = {
 _UNIT_HEADERS = {"unit", "units", "uom", "measure"}
 
 
+@time_it
 def _format_from_structured_json(structured: dict, section_label: str) -> str:
     """
     Formats a table's structured_json into a clean bullet list.
@@ -266,6 +273,7 @@ def _format_from_structured_json(structured: dict, section_label: str) -> str:
     return "\n".join(lines) if len(lines) > 1 else ""
 
 
+@time_it
 def _format_from_pipe_direct(table_lines: list[str], section_label: str) -> str:
     """
     Formats a pipe table directly from its raw lines, without structured_json.
@@ -331,6 +339,7 @@ def _format_from_pipe_direct(table_lines: list[str], section_label: str) -> str:
 # TABLE LOOKUP FROM _ready.json
 # ─────────────────────────────────────────────────────────────────────────────
 
+@time_it
 def _build_table_lookup(chunks: list[dict]) -> dict[int, list[dict]]:
     """
     Builds a page-keyed lookup of table chunks that have structured_json.
@@ -366,6 +375,7 @@ def _build_table_lookup(chunks: list[dict]) -> dict[int, list[dict]]:
     return lookup
 
 
+@time_it
 def _headers_match(pipe_headers: list[str], structured_headers: list[str]) -> bool:
     """
     Returns True if the pipe table's header row matches the structured_json headers.
@@ -383,6 +393,7 @@ def _headers_match(pipe_headers: list[str], structured_headers: list[str]) -> bo
     return matches >= threshold
 
 
+@time_it
 def _find_best_table_chunk(
     pipe_headers: list[str],
     candidates:   list[dict],
@@ -406,6 +417,7 @@ def _find_best_table_chunk(
 _HEADING_RE = re.compile(r"^#{1,3}\s+(.+)$")
 
 
+@time_it
 def _extract_sections_from_page(page_text: str) -> list[str]:
     """
     Finds all markdown section headings in a page's raw text.
@@ -427,6 +439,7 @@ def _extract_sections_from_page(page_text: str) -> list[str]:
 # PAGE CONTENT BUILDER — MAIN LOGIC
 # ─────────────────────────────────────────────────────────────────────────────
 
+@time_it
 def _build_page_entry(
     page_num:      int,
     raw_page_text: str,
@@ -515,6 +528,7 @@ def _build_page_entry(
 # PUBLIC ENTRY POINT — called by pipeline_controller.py
 # ─────────────────────────────────────────────────────────────────────────────
 
+@time_it
 def run_build_metadata(
     book_id:           str,
     ready_path:        str,
@@ -604,7 +618,7 @@ def run_build_metadata(
         encoding="utf-8",
     )
 
-    print(f"[METADATA] ✅ {total_pages} pages indexed → {out_file.name}")
+    print(f"[METADATA] DONE: {total_pages} pages indexed -> {out_file.name}")
 
     if progress_callback:
         progress_callback(59, "Page Metadata",

@@ -1,1 +1,4 @@
 __pycache__
+portable
+.logs/
+data/

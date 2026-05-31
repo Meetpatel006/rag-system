@@ -49,6 +49,7 @@ Called by pipeline_controller.py:
 """
 
 import re
+from parta.logger import time_it, async_time_it
 import json
 from pathlib import Path
 from typing import Optional
@@ -58,6 +59,7 @@ from typing import Optional
 # TABLE PARSING HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
+@time_it
 def _split_table_row(line: str) -> list:
     """
     Splits a markdown pipe table row into individual cell strings.
@@ -81,6 +83,7 @@ def _split_table_row(line: str) -> list:
     return cells
 
 
+@time_it
 def _is_separator_row(line: str) -> bool:
     """
     Returns True if the line is a markdown table separator.
@@ -96,6 +99,7 @@ def _is_separator_row(line: str) -> bool:
     return cleaned == ""
 
 
+@time_it
 def _parse_markdown_table(markdown: str) -> Optional[dict]:
     """
     Parses a raw markdown pipe table string into a structured dict.
@@ -173,12 +177,14 @@ def _parse_markdown_table(markdown: str) -> Optional[dict]:
     }
 
 
+@time_it
 def _is_table_line(line: str) -> bool:
     """Returns True if line looks like a markdown table row."""
     stripped = line.strip()
     return stripped.startswith("|") or stripped.count("|") >= 2
 
 
+@time_it
 def _build_linearized_text(
     structured: dict,
     section_path: list,
@@ -229,6 +235,7 @@ def _build_linearized_text(
 # PROCESSING FUNCTION
 # ─────────────────────────────────────────────────────────────────────────────
 
+@time_it
 def _enrich_table_chunk(chunk: dict) -> dict:
     """
     Takes a single chunk dict of type=="table" and adds the three
@@ -275,6 +282,7 @@ def _enrich_table_chunk(chunk: dict) -> dict:
 # PUBLIC ENTRY POINT — called by pipeline_controller.py
 # ─────────────────────────────────────────────────────────────────────────────
 
+@time_it
 def run_triple_rep(
     book_id:           str,
     json_path:         str,

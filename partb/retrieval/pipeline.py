@@ -263,8 +263,9 @@ def search_propositions(query: str, book_ids: list[str], limit: int) -> list[dic
     if book_ids:
         filters = qm.Filter(must=[qm.FieldCondition(key="book_id", match=qm.MatchAny(any=book_ids))])
     try:
-        hits = client.search(collection_name=COLLECTION_PROPS, query_vector=query_vec,
-                             query_filter=filters, limit=limit, with_payload=True)
+        response = client.query_points(collection_name=COLLECTION_PROPS, query=query_vec,
+                                       query_filter=filters, limit=limit, with_payload=True)
+        hits = response.points
     except Exception as exc:
         logging.warning("Propositions search failed: %s", exc)
         return []
@@ -406,11 +407,12 @@ def search_sections_direct(query: str, book_ids: list[str],
     from qdrant_client import models as qm
     client    = get_qdrant()
     query_vec = get_nomic().encode("search_query: " + query, show_progress_bar=False).tolist()
-    book_filter = (qm.Filter(must=[qm.FieldCondition(key="book_id", match=qm.MatchAny(any=book_ids))])
+    filters = (qm.Filter(must=[qm.FieldCondition(key="book_id", match=qm.MatchAny(any=book_ids))])
                    if book_ids else None)
     try:
-        hits = client.search(collection_name=COLLECTION_SECTIONS, query_vector=query_vec,
-                             query_filter=book_filter, limit=limit, with_payload=True)
+        response = client.query_points(collection_name=COLLECTION_SECTIONS, query=query_vec,
+                                       query_filter=filters, limit=limit, with_payload=True)
+        hits = response.points
     except Exception as exc:
         logging.warning("Sections search failed: %s", exc)
         return []
@@ -825,7 +827,6 @@ def build_user_message(query: str, context: str, history: list[dict]) -> str:
             f"Question: {query}{reminder}\nAnswer:")
 
 
-@async_time_it
 async def run_rag_stream(
     query: str, book_ids: list[str], mode: str, history: list[dict],
 ) -> AsyncIterator[dict]:

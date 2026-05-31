@@ -33,6 +33,7 @@ FIXES vs original provided file:
 """
 
 import time
+from parta.logger import time_it, async_time_it
 import json
 import concurrent.futures
 from pathlib import Path
@@ -44,6 +45,7 @@ from datetime import datetime, timezone
 BASE_DIR = Path(__file__).resolve().parent
 
 
+@time_it
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -52,6 +54,7 @@ def _now_iso() -> str:
 # Progress helpers
 # ---------------------------------------------------------------------------
 
+@time_it
 def update_progress(
     jobs_col, job_id, percent, stage, message,
     extra=None, qdrant_progress=None, neo4j_progress=None,
@@ -71,6 +74,7 @@ def update_progress(
     jobs_col.update_one({"job_id": job_id}, {"$set": update})
 
 
+@time_it
 def _make_callback(jobs_col, job_id):
     def callback(percent, stage, message, extra=None):
         update_progress(jobs_col, job_id, percent, stage, message, extra)
@@ -81,6 +85,7 @@ def _make_callback(jobs_col, job_id):
 # Stage runners
 # ---------------------------------------------------------------------------
 
+@time_it
 def _run_qdrant_stage(job_id, book_id, ready_path, prop_path, jobs_col):
     """
     Embeds propositions + sections into two Qdrant collections.
@@ -133,6 +138,7 @@ def _run_qdrant_stage(job_id, book_id, ready_path, prop_path, jobs_col):
         raise
 
 
+@time_it
 def _run_neo4j_stage(job_id, book_id, ready_path, jobs_col):
     """
     5-layer GLiNER + Regex + Neo4j graph ingestion.
@@ -213,6 +219,7 @@ def _run_neo4j_stage(job_id, book_id, ready_path, jobs_col):
 # Confidence report
 # ---------------------------------------------------------------------------
 
+@time_it
 def _generate_confidence_report(
     book_id:      str,
     ready_path:   str,
@@ -310,6 +317,7 @@ def _generate_confidence_report(
 # PHASE 1
 # ---------------------------------------------------------------------------
 
+@time_it
 def run_phase1(job: dict, jobs_col) -> tuple:
     """
     Runs Steps 1-3.
@@ -352,6 +360,11 @@ def run_phase1(job: dict, jobs_col) -> tuple:
                  message="Building triple representations for tables...")
         run_triple_rep(book_id, ready_path, callback)
 
+        from processing.build_metadata import run_build_metadata
+        callback(percent=58, stage="Metadata Processing",
+                 message="Building page metadata and format tables...")
+        run_build_metadata(book_id, ready_path, str(BASE_DIR), callback)
+
         from processing.propositions import run_propositions
         callback(percent=60, stage="Proposition Extraction",
                  message="Extracting atomic propositions from sections...")
@@ -392,6 +405,7 @@ def run_phase1(job: dict, jobs_col) -> tuple:
 # PHASE 2
 # ---------------------------------------------------------------------------
 
+@time_it
 def run_phase2(job: dict, jobs_col, mongo_db):
     """
     Reads checkpoint paths from MongoDB.
@@ -553,6 +567,7 @@ def run_phase2(job: dict, jobs_col, mongo_db):
         _fail_phase2(jobs_col, job_id, error_msg)
 
 
+@time_it
 def _fail_phase2(jobs_col, job_id: str, error_msg: str):
     """Marks ingestion_failed — checkpoint files stay on disk for /resume."""
     jobs_col.update_one(
@@ -569,6 +584,7 @@ def _fail_phase2(jobs_col, job_id: str, error_msg: str):
 # PUBLIC ENTRY POINT
 # ---------------------------------------------------------------------------
 
+@time_it
 def run_pipeline(job: dict, jobs_col, mongo_db):
     """
     Full pipeline entry point called by main_api.py queue_worker.

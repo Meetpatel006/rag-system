@@ -1,17 +1,16 @@
-chat.html
-
-<!DOCTYPE html>
 <!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
 <title>KRUTRIM — ISRO Knowledge Retrieval</title>
-<script src="static/marked.min.js"></script>
-<script src="/static/mermaid.min.js"></script>
-<script src="/static/pdf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/mermaid/dist/mermaid.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.min.js"></script>
 <script>
-	pdfjsLib.GlobalWorkerOptions.workerSrs = "/static/pdf.worker.min.js"
+  if (typeof pdfjsLib !== 'undefined') {
+    pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.worker.min.js";
+  }
 </script>
 <style>
 
@@ -375,8 +374,8 @@ html, body { height: 100%; font-family: -apple-system, BlinkMacSystemFont, 'Sego
 <!-- ── Login / Signup Screen ─────────────────────────────────── -->
 <div id="login-screen">
   <div id="login-box">
-    <img src= "/static/isro-logo.png" class="logo" alt= "ISRO"
-    onerror= "this.style.display='none'; this.nextElementsSibling.style.display= 'block';">
+    <img src= "/static/isro-logo.svg" class="logo" alt= "ISRO"
+    onerror= "this.style.display='none'; if(this.nextElementSibling) this.nextElementSibling.style.display= 'block';">
     <h1>KRUTRIM</h1>
     <p>ISRO knowledge retrieval — sign in or create an account</p>
     <div class="auth-tabs">
@@ -392,8 +391,9 @@ html, body { height: 100%; font-family: -apple-system, BlinkMacSystemFont, 'Sego
       <div class="field">
         <label>Password</label>
         <input type="password" id="login-password" placeholder="Enter password" autocomplete="current-password" onkeydown="if(event.key=='Enter')doLogin()"/>
-        <button id="login-btn" onclick="doLogin()">Sign In</button>
       </div>
+      <button id="login-btn" onclick="doLogin()">Sign In</button>
+    </div>
     <div id="form-signup" class="auth-form">
     <div id= "signup-error" style="color: #f87171; font-size: 12px; margin-bottom: 12px; display: none"></div>
       <div class="field">
@@ -406,7 +406,7 @@ html, body { height: 100%; font-family: -apple-system, BlinkMacSystemFont, 'Sego
       </div>
       <div class="field">
         <label>Password (min 6 chars) </label>
-        <input type="password" id="signup-password" placeholder="Enter password" onkeydown="if(event.key=='Enter')doLogin()"/>
+        <input type="password" id="signup-password" placeholder="Enter password" onkeydown="if(event.key=='Enter')doSignup()"/>
       </div>
       <button id="signup-btn" onclick="doSignup()">Create account</button>
     </div>
@@ -419,8 +419,8 @@ html, body { height: 100%; font-family: -apple-system, BlinkMacSystemFont, 'Sego
 <div id="app" style="display:none;">
   <div id="brand-bar">
   <div style="display:flex; slign-items: center; gap: 10px">
-    <img src= "/static/isro-logo.png" class="logo" alt= "ISRO"
-    onerror= "this.style.display='none'; this.nextElementsSibling.style.display= 'block';">
+    <img src= "/static/isro-logo.svg" class="logo" alt= "ISRO"
+    onerror= "this.style.display='none'; if(this.nextElementSibling) this.nextElementSibling.style.display= 'block';">
     <span id= "health-indicator" style="font-size: 11px; color: #475569">-</span>
    </div>
    <div class="brand-wordmark">
@@ -526,10 +526,9 @@ html, body { height: 100%; font-family: -apple-system, BlinkMacSystemFont, 'Sego
 
       <div id="book-panel-content" style="background: #0f1117; overflow: auto; position: relative;">
         <div id="pdf-placeholder">Click a source chip below an answer to view the PDF page.</div>
-        <div id="pdf-loading"><div class="spinner"></div> Loading…</div>
-        <div id="pdf-canvas-wrapper" style="display: none; padding: 20px; text-aligm: center; min-height: 100%;">
-           <canvas id ="pdf-canvas" style= "max-width: 10%; box-shadow: 0 8px rgba(0,0,0,0.5); boder-radius: 4px;"></canvas>
-        <div id="pdf-loading"><div class="spinner"></div> Loading…</div>
+        <div id="pdf-loading"><div class="spinner"></div> Loading...</div>
+        <div id="pdf-canvas-wrapper" style="display: none; padding: 20px; text-align: center; min-height: 100%;">
+           <canvas id ="pdf-canvas" style= "max-width: 100%; box-shadow: 0 8px 24px rgba(0,0,0,0.5); border-radius: 4px;"></canvas>
        </div>
      </div>
    </div>
@@ -587,30 +586,31 @@ const API = '';
 // ═════════════════════════════════════════════════════════════════
 // STATE
 // ═════════════════════════════════════════════════════════════════
-let token       = localstorage.getItem('kr_token') '';
-let currentUser = JSON.parse(localStorage.getItem('kr_ user') 'null');
-let activateChatId = null;
-let activateChatData = null;
+let token       = localStorage.getItem('kr_token') || '';
+let currentUser = JSON.parse(localStorage.getItem('kr_user') || 'null');
+let activeChatId = null;
+let activeChatData = null;
 let currentMode = 'balanced';
 let modalMode   = 'balanced';
-let Streaming  = false;
+let streaming  = false;
 let popupOpen    = false;
-let bookViewer   = { bookId: null, pageNumber: null};
+let bookViewer   = { bookId: null, pageNumber: 1, totalPages: 0 };
 
--- ── Marked setup ─────────────────────────────────────────── 
+// ── Marked setup ─────────────────────────────────────────── 
 function renderMarkdown(text){
- if (typeof marked !== 'umdefined'){
-   try { return marked.parse(text ''); } catch(e) {}
- return escHtml(text '').replace(/\n/g, '<br>');
+  if (typeof marked !== 'undefined'){
+    try { return marked.parse(text || ''); } catch(e) {}
+  }
+  return escHtml(text || '').replace(/\n/g, '<br>');
 }
 
- ── Auth helpers ─────────────────────────────────────────── 
-fuction authHeaders() { return {'content-type': 'application/json', 'Authorization': ~Bearer ${token}~ }; }
+// ── Auth helpers ─────────────────────────────────────────── 
+function authHeaders() { return {'content-type': 'application/json', 'Authorization': `Bearer ${token}` }; }
 
-async function apiFetch(paths, opts = {}){
+async function apiFetch(path, opts = {}){
  const res = await fetch(API + path, {
-     ..opts,
-  headers:{... authHeaders(), ...(opts.headers {}) }
+     ...opts,
+  headers:{...authHeaders(), ...(opts.headers || {}) }
  });
  if(res.status === 401) {logout(); return null;}
  return res;
@@ -620,26 +620,25 @@ async function apiFetch(paths, opts = {}){
 // AUTH forms
 // ═════════════════════════════════════════════════════════════════
 function showAuthForm(tab) {
-  document.querrySelectorAll('.auth-tab'). forEach((t, i) => t.classList.toggle('active', i === (tab === 'Login' ? 0 : 1)));
-  document.getElementById('form-login').classList.toggle('active', tab === 'Login' );
-  document.getElementById('form-signup').classList.toggle('active', tab !== 'Login' );
-
+  document.querySelectorAll('.auth-tab').forEach((t, i) => t.classList.toggle('active', i === (tab === 'login' ? 0 : 1)));
+  document.getElementById('form-login').classList.toggle('active', tab === 'login' );
+  document.getElementById('form-signup').classList.toggle('active', tab !== 'login' );
 }
 
 async function doLogin() {
   const email    = document.getElementById('login-email').value.trim();
-  const pass = document.getElementById('login-password').value;
+  const password = document.getElementById('login-password').value;
   const errEl = document.getElementById('login-error');
   errEl.style.display = 'none';
-  if (!email || !pass) { showErr( errrEl, 'Enter email and password are required.'); return; }
+  if (!email || !password) { showErr(errEl, 'Email and password are required.'); return; }
   try {
     const res  = await fetch(API + '/auth/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email, password }) });
     const data = await res.json();
-    if (!res.ok) { showLoginError(data.detail || 'Login failed.'); return; }
+    if (!res.ok) { showErr(errEl, data.detail || 'Login failed.'); return; }
     token = data.token;
-    currentUser = {Yser_id: data.user_id, name: data.name, email: data.email, role: data.role};
+    currentUser = { user_id: data.user_id, name: data.name, email: data.email, role: data.role };
     localStorage.setItem('kr_token', token);
-    localStorage.setItem('kr_token', JSON.stringify(currentUser));
+    localStorage.setItem('kr_user', JSON.stringify(currentUser));
     bootApp();
   } catch(e) { showErr(errEl,'Cannot connect to server. Is part B running?'); }
 }
@@ -654,9 +653,9 @@ async function doSignup() {
   try {
     const res  = await fetch(API + '/auth/signup', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name, email, password }) });
     const data = await res.json();
-    if (!res.ok) { showLoginError(data.detail || 'Signup failed.'); return; }
+    if (!res.ok) { showErr(errEl, data.detail || 'Signup failed.'); return; }
     document.getElementById('login-email').value = email;
-    document.getElementById('login-password').value = pass;
+    document.getElementById('login-password').value = password;
     showAuthForm('login');
     await doLogin();
   } catch(e) {showErr(errEl,'Network error'); }
@@ -676,7 +675,7 @@ function bootApp(){
    document.getElementById('login-screen').style.display= 'none';
    document.getElementById('app').style.display= 'flex';
    if (currentUser) {
-      document.getElementById('user-role-display').textcontent = `${currentUser.name} . ${currentUser.role}`;
+      document.getElementById('user-role-display').textContent = `${currentUser.name} . ${currentUser.role}`;
    }
    loadChats();
    checkHealth();
@@ -688,17 +687,19 @@ if (token && currentUser) bootApp();
 
 async function checkHealth() {
   const el = document.getElementById('health-indicator');
-  if (!name || !email || !password) { showErr(errEl, 'All fields required.'); return; }
+  if(!el) return;
   try {
     const res = await apiFetch('/health');
     if(!res) return;
-    const res = await res.json();
-    const data = Object.values(data).every(v => v.status === 'ok');
+    const data = await res.json();
+    const all = Object.values(data).every(v => v.status === 'ok');
     el.textContent = all ? ' All system ok' : ' Some services degraded';
     el.style.color = all ? '#4ade80' : '#fbbf24';
-    
-  } catch { el.textContent = 'offline'; el.style.color = '#f87171'; }
-setInternal(checkHealth, 60000);
+  } catch (e) { 
+    el.textContent = 'offline'; el.style.color = '#f87171'; 
+  }
+}
+setInterval(checkHealth, 60000);
 
 // ═════════════════════════════════════════════════════════════════
 // CHAT LIST ── identical to old file
@@ -717,13 +718,13 @@ function renderChatList(chats) {
     return;
   }
   el.innerHTML = chats.map(c => `
-    <div class="chat-item ${c.chat_id === activateChatId ? 'activate' : ''}" onclick="openchat('${c.chat_id}')">
+    <div class="chat-item ${c.chat_id === activeChatId ? 'active' : ''}" onclick="openChat('${c.chat_id}')">
       <span class="chat-item-icon">💬</span>
       <div class="chat-item-body">
-        <div class="chat-item-title">${escHtml(c.title)}</div>
-        <div class="chat-item-meta">${c.book_ids.length} book${c.book_ids.length!==1?'s':''}.${c.default_mode}</div>
+        <div class="chat-item-title">${escHtml(c.title || 'New Chat')}</div>
+        <div class="chat-item-meta">${(c.book_ids || []).length} book${(c.book_ids || []).length!==1?'s':''}.${c.default_mode || 'balanced'}</div>
       </div>
-      <button class="chat-item-delete" onclick="event.stopPropagation();deletechat('${c.chat_id}')" title="Delete">✕</button>
+      <button class="chat-item-delete" onclick="event.stopPropagation();deleteChat('${c.chat_id}')" title="Delete">X</button>
     </div>
   `).join('');
 }
@@ -732,10 +733,10 @@ function renderChatList(chats) {
 
 async function deleteChat(chatId) {
   if(! confirm('delete this chat and all its meassages?'))return;
-  await apiFetch(1/chats/${chatId}`, { method: 'DELETE'});
+  await apiFetch(`/chats/${chatId}`, { method: 'DELETE'});
   if (activeChatId === chatId) {
-     activateChatId = null;
-     activateChatData = null;
+     activeChatId = null;
+     activeChatData = null;
      resetChatView();
      }
      loadChats();
@@ -744,27 +745,28 @@ async function deleteChat(chatId) {
 //-------------open chat--------------------
 
 async function openChat(chatId) {
-  activateChatId = chatId;
-    const res  = await apiFetch(`/chats/${chatId}`);
+  activeChatId = chatId;
+    const res = await apiFetch(`/chats/${chatId}`);
     if (!res) return;
-    activateChatData = await res.json();
-    const data = await res.json()
-    currentMode = activateChatData.default_mode || 'balanced';
+    activeChatData = await res.json();
+    currentMode = activeChatData.default_mode || 'balanced';
     updateModeUI(currentMode);
 
-    document.getElementById('chat-title').textContent = activatechatData.title;
+    document.getElementById('chat-title').textContent = activeChatData.title || 'New Chat';
     document.getElementById('chat-title').style.color = '#e2e8f0';
-    document.getElementById('chat-title').innerHTML;
-      (activatechatData.book_ids.map(b=> `<span class="book-chip-header">📄 ${bid}</span>`).join('');
-    const area = document.getElementById('/chats/${chatId}/messages`);
+    document.getElementById('chat-title').innerHTML += ' ' + 
+      (activeChatData.book_ids || []).map(b => `<span class="book-chip-header">📄 ${escHtml(normalizeBookId(b))}</span>`).join('');
+      
+    const mres = await apiFetch(`/chats/${chatId}/messages`);
     if (!mres) return;
     const msgs = await mres.json();
     const area = document.getElementById('messages-area');
-    aera.innerHTML='';
+    area.innerHTML = '';
+    
     if (!msgs.length) {
-       area.innerHTML = '<div style="padding: 40px; colr:#475569; text-align:center; font-size: 13px">No message yet - ask your first question below.</div>;
-    } else{
-      msgs.forEach(m => appenfMessage(m.role, .content, m.source || 'balanced', false));
+       area.innerHTML = '<div style="padding: 40px; color:#475569; text-align:center; font-size: 13px">No message yet - ask your first question below.</div>';
+    } else {
+       msgs.forEach(m => appendMessage(m.role, m.content, m.sources || [], m.mode || currentMode, false));
     }
     area.scrollTop = area.scrollHeight;
     loadChats();
@@ -775,8 +777,8 @@ function resetChatView() {
     document.getElementById('chat-title').style.color = '#475569';
     document.getElementById('book-chips-area').innerHTML = '';
     document.getElementById('messages-area').innerHTML = `
-      <div id="padding: 40px; color: #477569; text-align: center: font-size: 13px"> Select a chat from the sidebar.</div><div class="icon">🛰</div><h3>ISRO Knowledge Assistant</h3>
-    
+      <div style="padding: 40px; color: #477569; text-align: center; font-size: 13px"> Select a chat from the sidebar.</div><div class="icon">🛰</div><h3>ISRO Knowledge Assistant</h3>
+    `;
 }
 
 
@@ -786,90 +788,100 @@ function resetChatView() {
 async function showNewChatModal() {
   document.getElementById('modal-overlay').classList.add('show');
   document.getElementById('book-error').style.display = 'none';
-  document.getElementById('nc-title').value = '';
+  document.getElementById('new-chat-name').value = '';
   modalMode = 'balanced';
   selectModalMode('balanced');
   const bsl  = document.getElementById('book-select-list');
   bsl.innerHTML= '<div style="color:#475569;font-size:12px;padding:8px;">Loading..</div>'  
-  const res   = await fetch('/library`'),
-  const data  = await res.json();
+  const res = await apiFetch('/library');
+  const data = await res.json();
   const books = data.books || [];
-  if (!books.length) { bsl.innerHTML = '<div style="color:#475569;font-size:12px;padding:8px;">No books in library. upload via PartA  first.</div>'; return; }
-    return;
+  if (!books.length) { 
+    bsl.innerHTML = '<div style="color:#475569;font-size:12px;padding:8px;">No books in library. upload via PartA first.</div>'; 
+    return; 
   }
-   bsl.innerHTML = books.map(b => `
-     <label class="book-select-item" onclick="toggleBookSelect(this)">
-       <input type="checkbox" value="${escHtml(b.book_id)}" onclick="event.stopPropagation();toggleBookSelect(this.cloest('label'))"/>
+  bsl.innerHTML = books.map(b => `
+     <label class="book-select-item">
+       <input type="checkbox" value="${escHtml(normalizeBookId(b))}" onchange="toggleBookSelect(this)"/>
        <div>
-         <div class="book-select-name">${escHtml(b.title || b.book_id)}</div>
-         <div class="book-select-meta">${b.total_chunks || 0} chunks · ${b.total_pages || 0} pages</div>
+         <div class="book-select-name">${escHtml(normalizeBookTitle(b))}</div>
+         <div class="book-select-meta">${b.total_chunks || 0} chunks . ${b.total_pages || 0} pages</div>
        </div>
-     </div>`).join('');
+     </label>`).join('');
 }
 
-function toggleBookSelect(bookId) {
-  const item = document.querySelector('input[type=checkbox]');
-  const cb   = document.getElementById(`bsc-${bookId}`);
-  cb.checked = !cb.checked;
-  item.classList.toggle('checked', cb.checked);
+function openNewChatModal() {
+  showNewChatModal();
 }
 
-function closeNewchatModal() {
-  document.getElementById('model-overlay').classList.remove('show');
+function toggleBookSelect(cb) {
+  const item = cb.closest('.book-select-item');
+  if (item) item.classList.toggle('checked', cb.checked);
+}
+
+function closeNewChatModal() {
+  document.getElementById('modal-overlay').classList.remove('show');
+}
 
 function selectModalMode(mode) {
   modalMode = mode;
-  ['fast','balance','deep'].forEach(m=> {
-  document.getElementById(`me-${m}`).classList.toggle('selected',m === mode));
+  ['fast','balanced','deep'].forEach(m => {
+    const el = document.getElementById(`mr-${m}`);
+    if (el) el.classList.toggle('selected', m === mode);
+  });
 }
 
 async function createChat() {
-  const title = document.getElementById('nc-title).value.trim() || null;
-  const bookIds = [...document.querrySelectorAll('#book-selct-list input:checked')].map(i => i.value);
-  const errEl = document.getElementById('modal-error);
+  const title = document.getElementById('new-chat-name').value.trim() || null;
+  const bookIds = [...document.querySelectorAll('#book-select-list input:checked')]
+    .map(i => normalizeBookId(i.value))
+    .filter(Boolean);
+  const errEl = document.getElementById('book-error');
   errEl.style.display = 'none';
-  if (!bookIds.length) { errEl.textcontent = 'Select aaaat least one book.'; errEl.style.display='block'; retur
-  const res  = await fetch('/chats', { method: 'POST', body: JSON.stringify({ title,book_ids: bookIds, default_mode: modalMode, title: chatName || undefined }) });
+  if (!bookIds.length) { errEl.textContent = 'Select at least one book.'; errEl.style.display='block'; return; }
+  const res = await apiFetch('/chats', { method: 'POST', body: JSON.stringify({ title, book_ids: bookIds, default_mode: modalMode }) });
   if(!res) return;
   const data = await res.json();
-  if (chat.detail){errEl.textContent = chat.detail; errrEl.style.display= 'block';  return; }
+  if (data.detail) { errEl.textContent = data.detail; errEl.style.display= 'block'; return; }
   closeNewChatModal();
-  await loadchats();
-  await openchat(chat.chat_id);
+  await loadChats();
+  const chat = data.chat || data;
+  await openChat(chat.chat_id);
 }
-
 
 // ═════════════════════════════════════════════════════════════════
 // MODE SELECTOR 
 // ═════════════════════════════════════════════════════════════════
 function toggleModePopup(e) {
   e.stopPropagation();
-  const p   = document.getElementById('mode-popup');
-  p.style.display = p.style.display = 'block' ? 'none' : 'block;
+  const p = document.getElementById('mode-popup');
+  p.style.display = p.style.display === 'block' ? 'none' : 'block';
 }
-document.addEventListener('click', () => {document.getElementById('mode-popup').style.display = 'none'; });
+document.addEventListener('click', () => { document.getElementById('mode-popup').style.display = 'none'; });
 
 function selectMode(mode) {
   currentMode = mode;
   updateModeUI(mode);
-  document.getElementById('mode-popup').style.display = 'none'; });
-  if (activeChatId){
+  document.getElementById('mode-popup').style.display = 'none';
+  if (activeChatId) {
      apiFetch(`/chats/${activeChatId}`,{ method: 'PATCH', body: JSON.stringify({default_mode: mode }) });
   }
 }
-
 
 function updateModeUI(mode) {
   const icons  = { fast: '⚡', balanced: '⚖', deep: '🧠' };
   const labels = { fast: 'Fast', balanced: 'Balanced', deep: 'Deep' };
 
-  document.getElementById('.mode-icon').textContent = icons[modes] || '⚖';
-  document.getElementById('.mode-label').textContent = labels[modes] || 'Balanced';
-  ['fast','balance','deep'].forEach(m=> {
-     document.getElementById(`mode-opt-${m}`).classList.toggle('selected',m === mode));
-     const mc = getElementById(`mc-${m}`);
-     mc.classList.toggle('on',m === mode);
-     mc.textContent = m === mode ? '✔️' : '';
+  document.getElementById('mode-icon').textContent = icons[mode] || '⚖';
+  document.getElementById('mode-label').textContent = labels[mode] || 'Balanced';
+  ['fast','balanced','deep'].forEach(m => {
+     const opt = document.getElementById(`mode-otp-${m}`);
+     if (opt) opt.classList.toggle('selected', m === mode);
+     const mc = document.getElementById(`mc-${m}`);
+     if (mc) {
+       mc.classList.toggle('on', m === mode);
+       mc.textContent = m === mode ? '✓' : '';
+     }
   });
 }
 
@@ -892,7 +904,7 @@ function appendMessage(role, content, sources, mode, animate = true) {
         <div class="msg-user-meta"><span class="mode-badge ${mode}">${modeLabel(mode)}</span></div>
       </div>`;
   } else {
-      const sourcesHtml  = buildSourcesHtml(sources) ;
+      const sourcesHtml  = buildSourceChips(sources) ;
       const actionsHtml  = `
 	   <div class="msg-actions">
 	      <button class="regen-btn" onclick="toggleRegenMenu(this)">↺ Regenerate
@@ -905,7 +917,7 @@ function appendMessage(role, content, sources, mode, animate = true) {
            </div>`;
 	 row.innerHTML = `
      		 <div class="msg-assistant">
-      	            <div class="msg-assistant-text>${renderMarkdown(content)}</div>
+      	            <div class="msg-assistant-text">${renderMarkdown(content)}</div>
           	     ${sourcesHtml}
                      ${actionsHtml}
                  </div>`;
@@ -924,7 +936,7 @@ function buildSourceChips(sources) {
 	 const sec = (s.section_path || []).slice(-1)[0] || s.book_id || '';
 	 const score = s.rerank_score ? ` .score:${s.rerank_score}` : '';
 	 return `<span class="source-chip"  data-book="${escHtml(s.book_id||'')}" data-page="${pr[0]||1}"
-	     onclick="openBookPanel('${escHtml(s.book_id||'')}','${escHtml(s.chunk_id||'')}',${pr[0]||1})"
+	     onclick="openBookPanel('${escHtml(s.book_id||'')}',${pr[0]||1})"
 	     title="${escHtml(s.book_id||'')} ${score}">
 	     📄 ${page ? page + ' . ' : ''}${escHtml(sec.substring(0,28))}
 	</span>`;
@@ -939,7 +951,7 @@ function buildSourceChips(sources) {
 // ═════════════════════════════════════════════════════════════════
 async function sendQuestion(overrideMode) {
   if (!activeChatId) { openNewChatModal(); return; }
-  if (Streaming) return; 
+  if (streaming) return; 
 
   const ta = document.getElementById('question-input');
   const q =  ta.value.trim();
@@ -955,9 +967,9 @@ async function sendQuestion(overrideMode) {
   const asstRow = document.createElement('div');
   asstRow.className = 'msg-row';
   const asstBubble = document.createElement('div');
-  asstBubble.className = 'msg-assisatant';
+  asstBubble.className = 'msg-assistant';
   const textEl = document.createElement('div');
-  textEl.className = 'msg-assisatant-text streaming';
+  textEl.className = 'msg-assistant-text streaming';
   textEl.innerHTML = `<div class="status-msg"><div class="status-dot"></div><span>Thinking...</span></div>`;
   asstBubble.appendChild(textEl);
   asstRow.appendChild(asstBubble);
@@ -967,40 +979,41 @@ async function sendQuestion(overrideMode) {
   let fulltext = '';
   let sources = [];
 
-  const res = await fetch(API + `/chats/${activeChatId}/ask`, { method: 'POST', headers: authHeaders(), body: JSON.stringify({ question: q, mode }) });
-  if (!res.ok || !res.body)throw new Error(`HTTP ${res.status}`);
-  const reader = res.body.getReader();
-  decoder = new TextDecoder();
-  let buf = '';
-  let firstToken = true;
+  try {
+    const res = await fetch(API + `/chats/${activeChatId}/ask`, { method: 'POST', headers: authHeaders(), body: JSON.stringify({ question: q, mode }) });
+    if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = '';
+    let firstToken = true;
 
-   while (true) {
+    while (true) {
       const {done, value} = await reader.read();
       if (done) break;
       buf += decoder.decode(value, { stream: true });
       const lines = buf.split('\n');
       buf = lines.pop();
-  for (const line of lines) {
+      for (const line of lines) {
         if (!line.startsWith('data: ')) continue;
         let evt;
         try { evt = JSON.parse(line.slice(5).trim()); } catch { continue; }
 
 	if (evt.type === 'status') {
-           textEl.innerHTML = `<div class="status-msg"><div class="status-dot"></div><span>${evt.message)}</span></div>`;
+           textEl.innerHTML = `<div class="status-msg"><div class="status-dot"></div><span>${escHtml(evt.message)}</span></div>`;
            textEl.classList.add('streaming');
         } else if (evt.type === 'token') {
           if (firstToken) { textEl.innerHTML = '';  textEl.classList.remove('streaming'); firstToken = false; }
           fulltext += evt.content;
-          textEl.innerHTML = renderMarkdown(fullText);
+          textEl.innerHTML = renderMarkdown(fulltext);
           area.scrollTop =  area.scrollHeight;
         } else if (evt.type === 'done') {
           sources = evt.sources || [];
-          textEl.innerHTML = renderMaekdown(fullText);
+          textEl.innerHTML = renderMarkdown(fulltext);
 
 
-          \\ add sources+ regen button
+          // add sources+ regen button
            const sourcesEl= document.createElement('div');
-           sourcesEl.innerHTML = buildsourceHtml(sources);
+           sourcesEl.innerHTML = buildSourceChips(sources);
            const actionsEl= document.createElement('div');
            actionsEl.innerHTML = `
                <div class="msg-actions">
@@ -1022,26 +1035,28 @@ async function sendQuestion(overrideMode) {
 	  textEl.classList.add('streaming');
       }
     }
-  } 
+  }
   }catch(err) { textEl.innerHTML = `<span style="color:#f87171"> Request failed: ${escHtml(String(err))}</span>`; }
-  finally { Streaming = false; document.getElementById('send-btn').disabled = false;  }
+  finally { streaming = false; document.getElementById('send-btn').disabled = false;  }
 }
 
 // ═════════════════════════════════════════════════════════════════
 // REGENERATE
 // ═════════════════════════════════════════════════════════════════
 function toggleRegenMenu(btn) {
-  const menu = btn.querySelector('rgrn-menu')
-  men.style.display = menu.style.display === 'block' ? 'none' : 'block';
+  const menu = btn.querySelector('.regen-menu');
+  if (menu) menu.style.display = menu.style.display === 'block' ? 'none' : 'block';
 }
 function regenWithMode(opt,mode){
-  opt.cloest('rgrn-menu').style.display = 'none'
-  const ta = document.getElentaryById('question-input');
+  const menu = opt.closest('.regen-menu');
+  if (menu) menu.style.display = 'none';
+  const ta = document.getElementById('question-input');
   // Get last user message
-  const userMsgs = document.querySelectionAll('.msg-user-text');
-  if (!userMsgs = length) return;
-  const lastQ = userMsgs[userMsgs.length - 1].textContent;ta.value = lastQ;
-  selectionMode(mode);
+  const userMsgs = document.querySelectorAll('.msg-user-text');
+  if (!userMsgs.length) return;
+  const lastQ = userMsgs[userMsgs.length - 1].textContent;
+  ta.value = lastQ;
+  selectMode(mode);
   sendQuestion(mode);
 }
 
@@ -1050,10 +1065,9 @@ function regenWithMode(opt,mode){
 // ═════════════════════════════════════════════════════════════════
     
  function useSuggestion(el) {
-   document.getElementById('question-input').value = el.
-   textContent.trim();
+   document.getElementById('question-input').value = el.textContent.trim();
    autoResize(document.getElementById('question-input'));
-   if (!activateChatId) openNewChatModel(); else sendQuestion()
+   if (!activeChatId) openNewChatModal(); else sendQuestion();
  }    
 
 
@@ -1063,8 +1077,8 @@ function regenWithMode(opt,mode){
 // ═════════════════════════════════════════════════════════════════
 
 
-let currentpdfDoc    = null;
-let isPageRendering  = null;
+let currentPdfDoc    = null;
+let isPageRendering  = false;
 let pageNumPending   = null;
 
 function _pdfUpdateNav() {
@@ -1073,28 +1087,27 @@ function _pdfUpdateNav() {
   document.getElementById('pdf-page-input').value = bookViewer.pageNumber;  
   document.getElementById('pdf-page-input').max= bookViewer.totalPages || 9999;
   document.getElementById('pdf-page-total').textContent= bookViewer.totalPages ? `of ${bookViewer.totalPages}` : 'of-';
-  document.getElementById('book-pannel-subtitle').textContent= bookViewer.totalPages `Page ${bookViewer.totalPages} of ${bookViewer.totalPages}` : `Page ${bookViewer.pageNumber}`;
+  document.getElementById('book-panel-subtitle').textContent =
+    bookViewer.totalPages ? `Page ${bookViewer.pageNumber} of ${bookViewer.totalPages}` : `Page ${bookViewer.pageNumber}`;
 }
 async function renderPage(num) {
-  if (!currentpdfDoc) return;
-  if (ispdfRendering) {
+  if (!currentPdfDoc) return;
+  if (isPageRendering) {
     pageNumPending = num;
     return;
    }
+  isPageRendering = true;
   try {
-    const page     = await currentpdfDoc.getPage(num);
+    const page     = await currentPdfDoc.getPage(num);
     const canvas = document.getElementById('pdf-canvas');
     const ctx      = canvas.getContext('2d');
     const viewport = page.getViewport({ scale: 1.5 });
-    const ctx      = canvas.getContext('2d');
     canvas.height  = viewport.height;
     canvas.width   = viewport.width;
-    };
-
+    const renderContext = { canvasContext: ctx, viewport };
     await page.render(renderContext).promise;
   } catch(error) {
     console.log("Error rendering page:", error);
-    }
   } finally {
     isPageRendering = false;
     if (pageNumPending !== null) {
@@ -1104,20 +1117,22 @@ async function renderPage(num) {
   }
 }
 
-async function openBookPage(bookI,pageNumber,msgId) {
-  document.querySelectorAll('.source-chip').forEach(c => c.classList.remove('active));
-  document.querySelectorAll(`#src-${msgId}.source-chip`).forEach(c =>
-    if(c.textcontent.includes(`Pg ${pageNumber}`)) c.classList.add('active));
-  });
+async function openBookPanel(bookId,pageNumber,msgId) {
+  document.querySelectorAll('.source-chip').forEach(c => c.classList.remove('active'));
+  if (msgId) {
+    document.querySelectorAll(`#src-${msgId} .source-chip`).forEach(c => {
+      if(c.textContent.includes(`p.${pageNumber}`) || c.textContent.includes(`Pg ${pageNumber}`)) c.classList.add('active');
+    });
+  }
 
   const panel = document.getElementById('book-panel');
   panel.classList.add('open');
-  document.getElementById('book-panel-title').textContent = bookID;
+  document.getElementById('book-panel-title').textContent = bookId;
   
   const parsedPage = parseInt(pageNumber,10);
-  const safePageNum = isNaN(parsedPage) ? 1 : Math.max(1,parsedpage);
+  const safePageNum = isNaN(parsedPage) ? 1 : Math.max(1,parsedPage);
   if (bookViewer.bookId === bookId && currentPdfDoc) {
-    bookViewer.pageNumber = safepageNum;
+    bookViewer.pageNumber = safePageNum;
      _pdfUpdateNav();
      renderPage(safePageNum);
      return;
@@ -1127,7 +1142,7 @@ async function openBookPage(bookI,pageNumber,msgId) {
    document.getElementById('pdf-canvas-wrapper').style.display = 'none'; 
 
    try {
-     const url =`${API}/pdf/${encoderURICompent(bookId)}?token=${encoderURICompnent(token)}`;
+     const url =`${API}/pdf/${encodeURIComponent(bookId)}?token=${encodeURIComponent(token)}`;
      const loadingTask = pdfjsLib.getDocument(url);
      currentPdfDoc = await loadingTask.promise;
 
@@ -1150,7 +1165,7 @@ async function openBookPage(bookI,pageNumber,msgId) {
 } 
 
 function pdfPrev() {
-  if (bookViewer.pageNumber<=1;) return;
+  if (bookViewer.pageNumber<=1) return;
   bookViewer.pageNumber--;
   _pdfUpdateNav();
   renderPage(bookViewer.pageNumber);
@@ -1162,13 +1177,13 @@ function pdfNext() {
   renderPage(bookViewer.pageNumber);
 }
 function pdfJumpTo(n) {
-  if (!currentpdfDoc) return;
+  if (!currentPdfDoc) return;
   const parsedN = parseInt( n , 10);
   if (isNaN(parsedN))return;
-  const page = Math.max(1,Math.min(bookViewer.totalpages || 99999, parsedN));
+  const page = Math.max(1,Math.min(bookViewer.totalPages || 99999, parsedN));
   bookViewer.pageNumber = page;
   _pdfUpdateNav();
-  renderpage(page);
+  renderPage(page);
 }
 
 function closeBookPanel() {
@@ -1176,13 +1191,15 @@ function closeBookPanel() {
   document.querySelectorAll('.source-chip').forEach(c => c.classList.remove('active'));
 
   if(currentPdfDoc){
-    currentPdfDoc.destory();
+    currentPdfDoc.destroy();
     currentPdfDoc= null;
+  }
 
 
   const canvas = document.getElementById('pdf-canvas');
   if(canvas) {
-     const ctx = canvas.width, canvas.height);
+     const ctx = canvas.getContext('2d');
+     ctx.clearRect(0, 0, canvas.width, canvas.height);
   }
 
   document.getElementById('pdf-canvas-wrapper').style.display = 'none'; 
@@ -1200,6 +1217,7 @@ function handleKey(e) {
   if (e.key === 'Enter' && !e.shiftKey) {
     e.preventDefault();
     sendQuestion();
+  }
 }
 function autoResize(el) {
   el.style.height = 'auto';
@@ -1211,6 +1229,27 @@ function escHtml(str) {
     .replace(/</g,'&lt;')
     .replace(/>/g,'&gt;')
     .replace(/"/g,'&quot;');
+}
+function normalizeBookId(book) {
+  if (book == null) return '';
+  if (typeof book === 'string') return book;
+  if (typeof book === 'object') return normalizeBookValue(book.book_id || book.id || book.title || book.book_title);
+  return String(book).trim();
+}
+function normalizeBookTitle(book) {
+  if (book == null) return '';
+  if (typeof book === 'string') return book;
+  if (typeof book === 'object') return normalizeBookValue(book.title || book.book_title || book.book_id || book.id);
+  return String(book).trim();
+}
+function normalizeBookValue(value) {
+  if (value == null) return '';
+  if (typeof value === 'string') return value.trim();
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+  if (typeof value === 'object') {
+    return String(value.book_id || value.id || value.title || value.book_title || value.$oid || '').trim();
+  }
+  return String(value).trim();
 }
 function modeLabel(mode) {
   return { fast: '⚡ Fast', balanced: '⚖ Balanced', deep: '🧠 Deep' }[mode] || mode;

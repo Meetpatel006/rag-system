@@ -11,8 +11,12 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import os
 from contextlib import asynccontextmanager
 from pathlib import Path
+
+# Fix import path so `from partb.x` works seamlessly when run inside `partb` folder
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -30,7 +34,6 @@ from partb.routers.pdf_router import router as pdf_router
 
 
 @asynccontextmanager
-@async_time_it
 async def lifespan(app: FastAPI):
      
     if str(PARTA_DIR) not in sys.path:

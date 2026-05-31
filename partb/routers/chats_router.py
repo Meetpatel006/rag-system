@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import uuid
 from datetime import datetime,timezone
+from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
@@ -22,8 +23,34 @@ router = APIRouter(prefix="/chats", tags=["chats"])
 
 class ChatCreate(BaseModel):
     title: str | None = None
-    book_ids: list[str]
+    book_ids: list[Any]
     default_mode: str = "balanced"
+
+    def normalized_book_ids(self) -> list[str]:
+        ids: list[str] = []
+        for item in self.book_ids:
+            value = _coerce_book_id(item)
+            value = value.strip()
+            if value:
+                ids.append(value)
+        return ids
+
+
+def _coerce_book_id(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        nested = (
+            value.get("book_id")
+            or value.get("id")
+            or value.get("title")
+            or value.get("book_title")
+            or value.get("$oid")
+        )
+        return _coerce_book_id(nested)
+    return str(value)
 
 class ChatPatch(BaseModel):
     title: str | None = None
@@ -40,7 +67,7 @@ def chats_col():
 
 @time_it
 def _now_iso()-> str:
-    return datetime.now(timezone.utc).isoformate()
+    return datetime.now(timezone.utc).isoformat()
 
 @time_it
 def _sse(data: dict) -> str:
@@ -58,29 +85,29 @@ def _assert_owner(chat_id: str, user_id: str) -> dict:
 
 @router.post("")
 @async_time_it
-async def create_chat(body: ChatRequest, user: dict = Depends(verify_token)):
-    if not body.book_ids:
+async def create_chat(body: ChatCreate, user: dict = Depends(verify_token)):
+    book_ids = body.normalized_book_ids()
+    if not book_ids:
         raise HTTPException(400, "At least one book must be selected.")
     if body.default_mode not in MODE_ORDER:
         raise HTTPException(400, f"mode must be one of {MODE_ORDER}")
 
-    chat_id = str(uuid.uuid(4))
     now = _now_iso()
 
     chat = {
         "chat_id": str(uuid.uuid4()),
         "user_id": user["user_id"],
         "title": (body.title or "New Chat").strip(),
-        "book_ids": body.book_ids,
+        "book_ids": book_ids,
         "default_mode": body.default_mode,
         "message_count": 0,
-        "created_at": datetime.utcnow(),
-        "updated_at": datetime.utcnow(),
+        "created_at": now,
+        "updated_at": now,
   
     }
     chats_col().insert_one(chat)
     chat.pop("_id", None)
-    return doc
+    return chat
 
 
 @router.get("")
