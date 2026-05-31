@@ -15,15 +15,15 @@ Run with:
     uvicorn extraction.extraction_server:app --host 0.0.0.0 --port 8004
 """
 
-import uuid
 import sys
+import uuid
 from pathlib import Path
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
-from parta.logger import time_it, async_time_it
-import time
-import threading
 import shutil
+import threading
+import time
 from pathlib import Path
 from typing import Dict
 
@@ -32,13 +32,15 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from pypdf import PdfReader, PdfWriter
 
+from parta.logger import async_time_it, logger, time_it
+
 app = FastAPI(title="Extraction Job Server")
 
 # ── Config ────────────────────────────────────────────────────────────────────
-CHUNK_SIZE        = 10    # pages per chunk sent to each worker
-LEASE_SECONDS     = 600   # lease per chunk; expired → back to PENDING
-MAX_ATTEMPTS      = 3     # per-chunk global cap (Bug C5: was 10, far too many)
-CLEANUP_DELAY_SEC = 300   # delete chunk files 5 min after book finishes
+CHUNK_SIZE = 10  # pages per chunk sent to each worker
+LEASE_SECONDS = 600  # lease per chunk; expired → back to PENDING
+MAX_ATTEMPTS = 3  # per-chunk global cap (Bug C5: was 10, far too many)
+CLEANUP_DELAY_SEC = 300  # delete chunk files 5 min after book finishes
 
 # ── In-memory state ───────────────────────────────────────────────────────────
 extractions: Dict[str, dict] = {}
@@ -56,10 +58,10 @@ def start_extraction(payload: dict):
     Creates one PENDING job per chunk.
     Returns immediately — workers pull jobs asynchronously.
     """
-    book_id      = payload.get("book_id")
-    pdf_path     = payload.get("pdf_path")
-    base_dir     = payload.get("base_dir", ".")
-    ocr_enabled  = bool(payload.get("ocr_enabled", False))
+    book_id = payload.get("book_id")
+    pdf_path = payload.get("pdf_path")
+    base_dir = payload.get("base_dir", ".")
+    ocr_enabled = bool(payload.get("ocr_enabled", False))
 
     if not book_id or not pdf_path:
         raise HTTPException(400, "book_id and pdf_path are required")
@@ -74,18 +76,18 @@ def start_extraction(payload: dict):
                 409,
                 f"Book '{book_id}' is already being extracted "
                 f"({existing['completed']}/{existing['total']} chunks done). "
-                "Wait for it to finish or restart the server to clear state."
+                "Wait for it to finish or restart the server to clear state.",
             )
 
     chunk_dir = Path(base_dir) / f"temp_extract_{book_id}"
     chunk_dir.mkdir(parents=True, exist_ok=True)
 
-    reader      = PdfReader(pdf_path)
+    reader = PdfReader(pdf_path)
     total_pages = len(reader.pages)
-    jobs        = {}
+    jobs = {}
     queue_order = []
 
-    print(f"[EXTRACT SERVER] Splitting {total_pages} pages for '{book_id}'...")
+    logger.info("Splitting %d pages for '%s'...", total_pages, book_id)
 
     for chunk_idx, start in enumerate(range(0, total_pages, CHUNK_SIZE)):
         end = min(start + CHUNK_SIZE, total_pages)
@@ -100,44 +102,44 @@ def start_extraction(payload: dict):
 
         jid = str(uuid.uuid4())
         jobs[jid] = {
-            "job_id":        jid,
-            "book_id":       book_id,
-            "chunk_idx":     chunk_idx,
-            "chunk_path":    str(chunk_path),
-            "start_offset":  start,
-            "page_count":    end - start,
-            "status":        "PENDING",
-            "assigned_to":   None,
-            "assigned_at":   0,
+            "job_id": jid,
+            "book_id": book_id,
+            "chunk_idx": chunk_idx,
+            "chunk_path": str(chunk_path),
+            "start_offset": start,
+            "page_count": end - start,
+            "status": "PENDING",
+            "assigned_to": None,
+            "assigned_at": 0,
             "lease_deadline": 0,
             "attempt_count": 0,
-            "result":        None,
+            "result": None,
         }
         queue_order.append(jid)
 
     total_chunks = len(queue_order)
-    print(f"[EXTRACT SERVER] {total_chunks} chunks queued for '{book_id}'")
+    logger.info("%d chunks queued for '%s'", total_chunks, book_id)
 
     with extraction_lock:
         extractions[book_id] = {
-            "jobs":        jobs,
-            "queue":       queue_order,
-            "total":       total_chunks,
+            "jobs": jobs,
+            "queue": queue_order,
+            "total": total_chunks,
             "total_pages": total_pages,
-            "completed":   0,
-            "failed":      0,
+            "completed": 0,
+            "failed": 0,
             "is_finished": False,
-            "chunk_dir":   str(chunk_dir),
-            "started_at":  time.time(),
+            "chunk_dir": str(chunk_dir),
+            "started_at": time.time(),
             "ocr_enabled": ocr_enabled,
         }
 
     return {
-        "status":       "started",
-        "book_id":      book_id,
+        "status": "started",
+        "book_id": book_id,
         "total_chunks": total_chunks,
-        "total_pages":  total_pages,
-        "ocr_enabled":  ocr_enabled,
+        "total_pages": total_pages,
+        "ocr_enabled": ocr_enabled,
     }
 
 
@@ -165,27 +167,34 @@ def get_job(worker_id: str = "unknown"):
             if state["is_finished"]:
                 continue
             any_active = True
-            jobs  = state["jobs"]
+            jobs = state["jobs"]
             queue = state["queue"]
 
             # ── Lease expiry rescue: expired PROCESSING → back to PENDING ─────
             for jid, job in jobs.items():
                 if job["status"] == "PROCESSING" and now > job["lease_deadline"]:
                     job["attempt_count"] += 1
-                    print(f"[EXTRACT SERVER] ⏱ Chunk {job['chunk_idx']} lease expired "
-                          f"(held by {job['assigned_to']}, attempt "
-                          f"{job['attempt_count']}/{MAX_ATTEMPTS})")
+                    logger.warning(
+                        "Chunk %s lease expired (held by %s, attempt %s/%s)",
+                        job["chunk_idx"],
+                        job["assigned_to"],
+                        job["attempt_count"],
+                        MAX_ATTEMPTS,
+                    )
 
                     if job["attempt_count"] >= MAX_ATTEMPTS:
                         job["status"] = "FAILED"
                         state["failed"] += 1
-                        print(f"[EXTRACT SERVER] ❌ Chunk {job['chunk_idx']} "
-                              f"permanently failed after {MAX_ATTEMPTS} attempts")
+                        logger.error(
+                            "Chunk %s permanently failed after %d attempts",
+                            job["chunk_idx"],
+                            MAX_ATTEMPTS,
+                        )
                         _check_finished(book_id, state)
                     else:
-                        job["status"]         = "PENDING"
-                        job["assigned_to"]    = None
-                        job["assigned_at"]    = 0
+                        job["status"] = "PENDING"
+                        job["assigned_to"] = None
+                        job["assigned_at"] = 0
                         job["lease_deadline"] = 0
 
             # ── Assign next PENDING chunk ─────────────────────────────────────
@@ -194,23 +203,26 @@ def get_job(worker_id: str = "unknown"):
                 if job["status"] != "PENDING":
                     continue
 
-                job["status"]         = "PROCESSING"
-                job["assigned_to"]    = worker_id
-                job["assigned_at"]    = now
+                job["status"] = "PROCESSING"
+                job["assigned_to"] = worker_id
+                job["assigned_at"] = now
                 job["lease_deadline"] = now + LEASE_SECONDS
 
-                print(f"[EXTRACT SERVER] → Chunk {job['chunk_idx']} "
-                      f"(pages {job['start_offset']+1}–"
-                      f"{job['start_offset']+job['page_count']}) "
-                      f"→ {worker_id}")
+                logger.info(
+                    "Chunk %s (pages %d-%d) assigned to %s",
+                    job["chunk_idx"],
+                    job["start_offset"] + 1,
+                    job["start_offset"] + job["page_count"],
+                    worker_id,
+                )
 
                 return {
-                    "action":       "PROCESS",
-                    "job_id":       jid,
-                    "book_id":      book_id,
-                    "chunk_idx":    job["chunk_idx"],
+                    "action": "PROCESS",
+                    "job_id": jid,
+                    "book_id": book_id,
+                    "chunk_idx": job["chunk_idx"],
                     "start_offset": job["start_offset"],
-                    "ocr_enabled":  state.get("ocr_enabled", False),
+                    "ocr_enabled": state.get("ocr_enabled", False),
                 }
 
     # FIX 1: Return WAIT when no active books — workers keep polling for next upload
@@ -260,10 +272,10 @@ def submit_result(payload: dict):
     Idempotent: duplicate submits for the same job_id are safely ignored.
     No blacklist: failed workers can retry; dead workers simply stop polling.
     """
-    jid       = payload.get("job_id")
+    jid = payload.get("job_id")
     worker_id = payload.get("worker_id", "unknown")
-    success   = payload.get("success", False)
-    content   = payload.get("content", "")
+    success = payload.get("success", False)
+    content = payload.get("content", "")
 
     with extraction_lock:
         for book_id, state in extractions.items():
@@ -280,23 +292,36 @@ def submit_result(payload: dict):
                 job["status"] = "COMPLETED"
                 job["result"] = content
                 state["completed"] += 1
-                print(f"[EXTRACT SERVER] ✅ Chunk {job['chunk_idx']} done "
-                      f"by {worker_id} [{state['completed']}/{state['total']}]")
+                logger.info(
+                    "Chunk %s done by %s [%d/%d]",
+                    job["chunk_idx"],
+                    worker_id,
+                    state["completed"],
+                    state["total"],
+                )
             else:
                 # Worker failed — return chunk to PENDING (no blacklist)
                 job["attempt_count"] += 1
-                print(f"[EXTRACT SERVER] ⚠ Chunk {job['chunk_idx']} failed "
-                      f"by {worker_id} (attempt {job['attempt_count']}/{MAX_ATTEMPTS})")
+                logger.warning(
+                    "Chunk %s failed by %s (attempt %d/%d)",
+                    job["chunk_idx"],
+                    worker_id,
+                    job["attempt_count"],
+                    MAX_ATTEMPTS,
+                )
 
                 if job["attempt_count"] >= MAX_ATTEMPTS:
                     job["status"] = "FAILED"
                     state["failed"] += 1
-                    print(f"[EXTRACT SERVER] ❌ Chunk {job['chunk_idx']} "
-                          f"permanently failed after {MAX_ATTEMPTS} attempts")
+                    logger.error(
+                        "Chunk %s permanently failed after %d attempts",
+                        job["chunk_idx"],
+                        MAX_ATTEMPTS,
+                    )
                 else:
-                    job["status"]         = "PENDING"
-                    job["assigned_to"]    = None
-                    job["assigned_at"]    = 0
+                    job["status"] = "PENDING"
+                    job["assigned_to"] = None
+                    job["assigned_at"] = 0
                     job["lease_deadline"] = 0
 
             _check_finished(book_id, state)
@@ -327,13 +352,13 @@ def extraction_status(book_id: str):
         overall = "failed" if state["failed"] > 0 else "completed"
 
     return {
-        "book_id":       book_id,
-        "status":        overall,
-        "total_chunks":  state["total"],
-        "completed":     state["completed"],
-        "failed":        state["failed"],
-        "is_finished":   state["is_finished"],
-        "percent":       int(state["completed"] / max(state["total"], 1) * 100),
+        "book_id": book_id,
+        "status": overall,
+        "total_chunks": state["total"],
+        "completed": state["completed"],
+        "failed": state["failed"],
+        "is_finished": state["is_finished"],
+        "percent": int(state["completed"] / max(state["total"], 1) * 100),
         "failed_chunks": failed_chunks,
     }
 
@@ -361,7 +386,7 @@ def get_result(book_id: str):
         raise HTTPException(
             500,
             f"Chunks {failed} permanently failed after {MAX_ATTEMPTS} attempts. "
-            "Check PDF integrity and Docling workers."
+            "Check PDF integrity and Docling workers.",
         )
 
     full_text = f"# Text Extraction: {book_id}\n\n"
@@ -394,13 +419,16 @@ def _check_finished(book_id: str, state: dict):
     done = state["completed"] + state["failed"]
     if done >= state["total"] and not state["is_finished"]:
         state["is_finished"] = True
-        label = "❌ FAILED" if state["failed"] > 0 else "✅ COMPLETE"
-        print(f"[EXTRACT SERVER] {label} — '{book_id}' "
-              f"({state['completed']}/{state['total']} chunks)")
+        label = "FAILED" if state["failed"] > 0 else "COMPLETE"
+        logger.info(
+            "Extraction %s — '%s' (%d/%d chunks)",
+            label,
+            book_id,
+            state["completed"],
+            state["total"],
+        )
         threading.Thread(
-            target=_cleanup_after_delay,
-            args=(state["chunk_dir"],),
-            daemon=True
+            target=_cleanup_after_delay, args=(state["chunk_dir"],), daemon=True
         ).start()
 
 
@@ -408,7 +436,7 @@ def _check_finished(book_id: str, state: dict):
 def _cleanup_after_delay(chunk_dir: str):
     time.sleep(CLEANUP_DELAY_SEC)
     shutil.rmtree(chunk_dir, ignore_errors=True)
-    print(f"[EXTRACT SERVER] 🧹 Cleaned {chunk_dir}")
+    logger.info("Cleaned temp dir: %s", chunk_dir)
 
 
 if __name__ == "__main__":

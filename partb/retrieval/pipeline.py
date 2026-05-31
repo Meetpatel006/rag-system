@@ -48,6 +48,7 @@ CHANGES IN THIS VERSION vs previous:
     search_sections_direct, merge_candidates, rerank_candidates,
     _sentences, _history_block, build_user_message, run_rag_stream
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -55,6 +56,7 @@ import json
 import logging
 import re
 import sys
+import time
 from typing import Any, AsyncIterator
 
 from partb.config import (
@@ -78,8 +80,7 @@ from partb.config import (
     RERANKER_DIR,
     SECT_RETRIEVE_LIMIT,
 )
-from partb.logger import time_it, async_time_it
-
+from partb.logger import async_time_it, log_process, logger, time_it
 from partb.retrieval.prompts import get_system_prompt
 
 logging.getLogger("transformers").setLevel(logging.ERROR)
@@ -87,10 +88,10 @@ logging.getLogger("transformers").setLevel(logging.ERROR)
 if str(PARTA_DIR) not in sys.path:
     sys.path.insert(0, str(PARTA_DIR))
 
-_gliner      = None
-_reranker    = None
-_neo_driver  = None
-_qdrant_cl   = None
+_gliner = None
+_reranker = None
+_neo_driver = None
+_qdrant_cl = None
 _nomic_model = None
 
 # In-process cache for metadata JSON — avoids re-reading disk on every query
@@ -102,10 +103,13 @@ def get_gliner():
     global _gliner
     if _gliner is None:
         from gliner import GLiNER
+
         model_dir = PORTABLE_DIR / "gliner"
         if not model_dir.exists():
             raise FileNotFoundError(f"GLiNER not found at {model_dir}")
-        _gliner = GLiNER.from_pretrained(str(model_dir), local_files_only=True).to("cpu")
+        _gliner = GLiNER.from_pretrained(str(model_dir), local_files_only=True).to(
+            "cpu"
+        )
     return _gliner
 
 
@@ -114,7 +118,13 @@ def get_neo4j():
     global _neo_driver
     if _neo_driver is None:
         from neo4j import GraphDatabase
-        _neo_driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD), max_connection_lifetime=200, keep_alive=True)
+
+        _neo_driver = GraphDatabase.driver(
+            NEO4J_URI,
+            auth=(NEO4J_USER, NEO4J_PASSWORD),
+            max_connection_lifetime=200,
+            keep_alive=True,
+        )
         _neo_driver.verify_connectivity()
     return _neo_driver
 
@@ -124,6 +134,7 @@ def get_reranker():
     global _reranker
     if _reranker is None:
         from sentence_transformers import CrossEncoder
+
         cfg_path = RERANKER_DIR / "config.json"
         if not cfg_path.is_file():
             raise FileNotFoundError(f"Reranker not found at {RERANKER_DIR}")
@@ -136,7 +147,9 @@ def get_qdrant():
     global _qdrant_cl
     if _qdrant_cl is None:
         from qdrant_client import QdrantClient
+
         from partb.config import QDRANT_API_KEY
+
         _qdrant_cl = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
     return _qdrant_cl
 
@@ -146,21 +159,26 @@ def get_nomic():
     global _nomic_model
     if _nomic_model is None:
         from sentence_transformers import SentenceTransformer
+
         model_dir = PORTABLE_DIR / "nomic"
         if not model_dir.exists():
             raise FileNotFoundError(f"Nomic not found at {model_dir}")
-        _nomic_model = SentenceTransformer(str(model_dir), trust_remote_code=True, device="cpu")
+        _nomic_model = SentenceTransformer(
+            str(model_dir), trust_remote_code=True, device="cpu"
+        )
     return _nomic_model
 
 
-@time_it
+@log_process
 def warm_models() -> None:
-    get_neo4j(); get_qdrant()
+    get_neo4j()
+    get_qdrant()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TABLE FORMATTING
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 @time_it
 def format_table_for_llm(chunk: dict) -> str:
@@ -168,30 +186,38 @@ def format_table_for_llm(chunk: dict) -> str:
     Converts a table chunk into LLM-readable bullet list format.
     Priority: structured_json → linearized_text → raw text.
     """
-    section_path  = chunk.get("section_path") or []
+    section_path = chunk.get("section_path") or []
     section_label = " > ".join(section_path) if section_path else "Unknown Section"
-    pr            = chunk.get("page_range") or [0, 0]
-    bid           = chunk.get("book_id") or "?"
+    pr = chunk.get("page_range") or [0, 0]
+    bid = chunk.get("book_id") or "?"
 
     structured = chunk.get("structured_json")
     if structured and isinstance(structured, dict):
         headers = structured.get("headers") or []
-        rows    = structured.get("rows") or []
+        rows = structured.get("rows") or []
 
         if headers and rows:
-            lines = [f"Specification Data [{section_label}] [Book: {bid} | Page: {pr[0]}-{pr[1]}]:"]
+            lines = [
+                f"Specification Data [{section_label}] [Book: {bid} | Page: {pr[0]}-{pr[1]}]:"
+            ]
             for row in rows:
                 lowered = {k.lower().strip(): v for k, v in row.items()}
                 param = (
-                    lowered.get("parameter") or lowered.get("item") or
-                    lowered.get("name") or lowered.get("description") or
-                    lowered.get("property") or lowered.get("characteristic") or
-                    next(iter(row.values()), "")
+                    lowered.get("parameter")
+                    or lowered.get("item")
+                    or lowered.get("name")
+                    or lowered.get("description")
+                    or lowered.get("property")
+                    or lowered.get("characteristic")
+                    or next(iter(row.values()), "")
                 )
                 value = (
-                    lowered.get("value") or lowered.get("values") or
-                    lowered.get("data") or lowered.get("result") or
-                    lowered.get("measurement") or ""
+                    lowered.get("value")
+                    or lowered.get("values")
+                    or lowered.get("data")
+                    or lowered.get("result")
+                    or lowered.get("measurement")
+                    or ""
                 )
                 unit = lowered.get("unit") or lowered.get("units") or ""
                 if param and value:
@@ -217,10 +243,7 @@ def format_table_for_llm(chunk: dict) -> str:
 
     raw = (chunk.get("text") or chunk.get("content") or "").strip()
     if raw:
-        return (
-            f"Data [{section_label}] [Book: {bid} | Page: {pr[0]}-{pr[1]}]:\n"
-            f"{raw}"
-        )
+        return f"Data [{section_label}] [Book: {bid} | Page: {pr[0]}-{pr[1]}]:\n{raw}"
     return ""
 
 
@@ -230,17 +253,17 @@ def format_specs_block(specs: list[dict]) -> str:
     if not specs:
         return ""
     lines = ["=== VERIFIED TECHNICAL SPECIFICATIONS (Knowledge Graph) ==="]
-    seen  = set()
+    seen = set()
     for sp in specs[:30]:
-        entity  = (sp.get("entity") or "").strip()
-        raw     = (sp.get("raw") or "").strip()
+        entity = (sp.get("entity") or "").strip()
+        raw = (sp.get("raw") or "").strip()
         if not entity or not raw:
             continue
         key = (entity.lower(), raw.lower())
         if key in seen:
             continue
         seen.add(key)
-        section  = (sp.get("section") or "").strip()
+        section = (sp.get("section") or "").strip()
         sec_note = f" [{section}]" if section else ""
         lines.append(f"  - {entity.title()}: {raw}{sec_note}")
     if len(lines) == 1:
@@ -253,18 +276,27 @@ def format_specs_block(specs: list[dict]) -> str:
 # RETRIEVAL STEPS 1-6
 # ─────────────────────────────────────────────────────────────────────────────
 
-@time_it
+
+@log_process
 def search_propositions(query: str, book_ids: list[str], limit: int) -> list[dict]:
     from qdrant_client import models as qm
-    client    = get_qdrant()
-    model     = get_nomic()
+
+    client = get_qdrant()
+    model = get_nomic()
     query_vec = model.encode("search_query: " + query, show_progress_bar=False).tolist()
     filters = None
     if book_ids:
-        filters = qm.Filter(must=[qm.FieldCondition(key="book_id", match=qm.MatchAny(any=book_ids))])
+        filters = qm.Filter(
+            must=[qm.FieldCondition(key="book_id", match=qm.MatchAny(any=book_ids))]
+        )
     try:
-        response = client.query_points(collection_name=COLLECTION_PROPS, query=query_vec,
-                                       query_filter=filters, limit=limit, with_payload=True)
+        response = client.query_points(
+            collection_name=COLLECTION_PROPS,
+            query=query_vec,
+            query_filter=filters,
+            limit=limit,
+            with_payload=True,
+        )
         hits = response.points
     except Exception as exc:
         logging.warning("Propositions search failed: %s", exc)
@@ -273,27 +305,36 @@ def search_propositions(query: str, book_ids: list[str], limit: int) -> list[dic
     for h in hits:
         pl = h.payload or {}
         pr = pl.get("page_range")
-        page_list = ([pr.get("start", 0), pr.get("end", 0)] if isinstance(pr, dict)
-                     else pr if isinstance(pr, list) else [pl.get("page", 0)] * 2)
-        results.append({
-            "proposition_id":  str(h.id),
-            "text":            pl.get("text") or "",
-            "parent_chunk_id": pl.get("parent_chunk_id"),
-            "section_path":    pl.get("section_path") or [],
-            "page_range":      page_list,
-            "source_type":     pl.get("source_type") or "text",
-            "book_id":         pl.get("book_id"),
-            "score":           h.score,
-        })
+        page_list = (
+            [pr.get("start", 0), pr.get("end", 0)]
+            if isinstance(pr, dict)
+            else pr
+            if isinstance(pr, list)
+            else [pl.get("page", 0)] * 2
+        )
+        results.append(
+            {
+                "proposition_id": str(h.id),
+                "text": pl.get("text") or "",
+                "parent_chunk_id": pl.get("parent_chunk_id"),
+                "section_path": pl.get("section_path") or [],
+                "page_range": page_list,
+                "source_type": pl.get("source_type") or "text",
+                "book_id": pl.get("book_id"),
+                "score": h.score,
+            }
+        )
     return results
 
 
-@time_it
+@log_process
 def extract_query_entities(query: str) -> list[str]:
     model = get_gliner()
     try:
         preds = model.predict_entities(
-            query.replace("\n", " ").strip(), ENTITY_LABELS, threshold=GLINER_QUERY_THRESHOLD
+            query.replace("\n", " ").strip(),
+            ENTITY_LABELS,
+            threshold=GLINER_QUERY_THRESHOLD,
         )
     except Exception as exc:
         logging.warning("GLiNER failed: %s", exc)
@@ -303,12 +344,15 @@ def extract_query_entities(query: str) -> list[str]:
     for p in preds:
         t = (p.get("text") or "").strip().lower()
         if t and t not in seen and len(t) >= 3:
-            seen.add(t); terms.append(t)
+            seen.add(t)
+            terms.append(t)
     return terms
 
 
-@time_it
-def neo4j_sections_for_entities(book_ids: list[str], entity_terms: list[str]) -> list[str]:
+@log_process
+def neo4j_sections_for_entities(
+    book_ids: list[str], entity_terms: list[str]
+) -> list[str]:
     if not entity_terms or not book_ids:
         return []
     cypher = """
@@ -322,18 +366,20 @@ def neo4j_sections_for_entities(book_ids: list[str], entity_terms: list[str]) ->
     """
     try:
         with get_neo4j().session() as session:
-            rows = session.run(cypher, book_ids=book_ids, terms=entity_terms, lim=NEO4J_ENTITY_LIMIT)
+            rows = session.run(
+                cypher, book_ids=book_ids, terms=entity_terms, lim=NEO4J_ENTITY_LIMIT
+            )
             return [
-                r["section_name"] for r in rows
-                if r.get("section_name") is not None
-                and str(r["section_name"]).strip()
+                r["section_name"]
+                for r in rows
+                if r.get("section_name") is not None and str(r["section_name"]).strip()
             ]
     except Exception as exc:
         logging.warning("Neo4j traversal failed: %s", exc)
         return []
 
 
-@time_it
+@log_process
 def neo4j_specs_for_terms(book_ids: list[str], entity_terms: list[str]) -> list[dict]:
     if not entity_terms or not book_ids:
         return []
@@ -350,13 +396,14 @@ def neo4j_specs_for_terms(book_ids: list[str], entity_terms: list[str]) -> list[
             rows = session.run(cypher, book_ids=book_ids, terms=entity_terms)
             return [
                 {
-                    "entity":  r["entity"]  or "",
-                    "value":   r["value"],
-                    "unit":    r["unit"]    or "",
-                    "raw":     r["raw"]     or "",
+                    "entity": r["entity"] or "",
+                    "value": r["value"],
+                    "unit": r["unit"] or "",
+                    "raw": r["raw"] or "",
                     "section": r["section"] or "",
                 }
-                for r in rows if r.get("raw")
+                for r in rows
+                if r.get("raw")
             ]
     except Exception as exc:
         logging.warning("Neo4j spec lookup failed: %s", exc)
@@ -367,33 +414,43 @@ def neo4j_specs_for_terms(book_ids: list[str], entity_terms: list[str]) -> list[
 def _parse_payload(pl: dict, pid: str) -> dict:
     """Parses a Qdrant section payload into a standard dict."""
     pr = pl.get("page_range")
-    page_list = ([pr.get("start", 0), pr.get("end", 0)] if isinstance(pr, dict)
-                 else pr if isinstance(pr, list) else [0, 0])
+    page_list = (
+        [pr.get("start", 0), pr.get("end", 0)]
+        if isinstance(pr, dict)
+        else pr
+        if isinstance(pr, list)
+        else [0, 0]
+    )
     return {
-        "chunk_id":        pid,
-        "text":            pl.get("text") or "",
-        "book_id":         pl.get("book_id"),
-        "section_path":    pl.get("section_path") or [],
-        "page_range":      page_list,
-        "chunk_type":      pl.get("chunk_type") or "text",
+        "chunk_id": pid,
+        "text": pl.get("text") or "",
+        "book_id": pl.get("book_id"),
+        "section_path": pl.get("section_path") or [],
+        "page_range": page_list,
+        "chunk_type": pl.get("chunk_type") or "text",
         "structured_json": pl.get("structured_json"),
         "linearized_text": pl.get("linearized_text"),
-        "from_qdrant":     True,
-        "from_neo4j":      False,
-        "qdrant_score":    None,
+        "from_qdrant": True,
+        "from_neo4j": False,
+        "qdrant_score": None,
     }
 
 
 @time_it
-def fetch_sections_by_chunk_ids(chunk_ids: list[str], book_ids: list[str]) -> list[dict]:
+def fetch_sections_by_chunk_ids(
+    chunk_ids: list[str], book_ids: list[str]
+) -> list[dict]:
     if not chunk_ids:
         return []
     client = get_qdrant()
     results = []
     for i in range(0, len(chunk_ids), 64):
         try:
-            pts = client.retrieve(collection_name=COLLECTION_SECTIONS,
-                                  ids=chunk_ids[i: i + 64], with_payload=True)
+            pts = client.retrieve(
+                collection_name=COLLECTION_SECTIONS,
+                ids=chunk_ids[i : i + 64],
+                with_payload=True,
+            )
             for p in pts:
                 results.append(_parse_payload(p.payload or {}, str(p.id)))
         except Exception as exc:
@@ -402,16 +459,30 @@ def fetch_sections_by_chunk_ids(chunk_ids: list[str], book_ids: list[str]) -> li
 
 
 @time_it
-def search_sections_direct(query: str, book_ids: list[str],
-                            section_names: list[str], limit: int) -> list[dict]:
+def search_sections_direct(
+    query: str, book_ids: list[str], section_names: list[str], limit: int
+) -> list[dict]:
     from qdrant_client import models as qm
-    client    = get_qdrant()
-    query_vec = get_nomic().encode("search_query: " + query, show_progress_bar=False).tolist()
-    filters = (qm.Filter(must=[qm.FieldCondition(key="book_id", match=qm.MatchAny(any=book_ids))])
-                   if book_ids else None)
+
+    client = get_qdrant()
+    query_vec = (
+        get_nomic().encode("search_query: " + query, show_progress_bar=False).tolist()
+    )
+    filters = (
+        qm.Filter(
+            must=[qm.FieldCondition(key="book_id", match=qm.MatchAny(any=book_ids))]
+        )
+        if book_ids
+        else None
+    )
     try:
-        response = client.query_points(collection_name=COLLECTION_SECTIONS, query=query_vec,
-                                       query_filter=filters, limit=limit, with_payload=True)
+        response = client.query_points(
+            collection_name=COLLECTION_SECTIONS,
+            query=query_vec,
+            query_filter=filters,
+            limit=limit,
+            with_payload=True,
+        )
         hits = response.points
     except Exception as exc:
         logging.warning("Sections search failed: %s", exc)
@@ -425,14 +496,19 @@ def search_sections_direct(query: str, book_ids: list[str],
         seen.add(cid)
         s = _parse_payload(h.payload or {}, cid)
         s["qdrant_score"] = h.score
-        s["from_neo4j"]   = any(n in (s.get("section_path") or []) for n in section_names) if section_names else False
+        s["from_neo4j"] = (
+            any(n in (s.get("section_path") or []) for n in section_names)
+            if section_names
+            else False
+        )
         results.append(s)
     return results
 
 
 @time_it
-def merge_candidates(parent_sections: list[dict], direct_sections: list[dict],
-                     neo4j_names: list[str]) -> list[dict]:
+def merge_candidates(
+    parent_sections: list[dict], direct_sections: list[dict], neo4j_names: list[str]
+) -> list[dict]:
     by_id: dict[str, dict] = {}
     for s in parent_sections + direct_sections:
         cid = s.get("chunk_id", "")
@@ -441,8 +517,12 @@ def merge_candidates(parent_sections: list[dict], direct_sections: list[dict],
         if cid not in by_id:
             by_id[cid] = s.copy()
         else:
-            by_id[cid]["from_qdrant"] = by_id[cid].get("from_qdrant") or s.get("from_qdrant")
-            by_id[cid]["from_neo4j"]  = by_id[cid].get("from_neo4j")  or s.get("from_neo4j")
+            by_id[cid]["from_qdrant"] = by_id[cid].get("from_qdrant") or s.get(
+                "from_qdrant"
+            )
+            by_id[cid]["from_neo4j"] = by_id[cid].get("from_neo4j") or s.get(
+                "from_neo4j"
+            )
             for field in ("structured_json", "linearized_text"):
                 if not by_id[cid].get(field) and s.get(field):
                     by_id[cid][field] = s[field]
@@ -455,7 +535,7 @@ def merge_candidates(parent_sections: list[dict], direct_sections: list[dict],
     return [s for s in by_id.values() if (s.get("text") or "").strip()]
 
 
-@time_it
+@log_process
 def rerank_candidates(query: str, candidates: list[dict], top_n: int) -> list[dict]:
     if not candidates:
         return []
@@ -481,6 +561,7 @@ def rerank_candidates(query: str, candidates: list[dict], top_n: int) -> list[di
 # STEP 7 — PAGE EXPANSION  ← NEW
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 @time_it
 def _load_metadata(book_id: str) -> dict | None:
     """
@@ -500,7 +581,9 @@ def _load_metadata(book_id: str) -> dict | None:
         _metadata_cache[book_id] = data
         return data
     except Exception as exc:
-        logging.warning("[page_expand] failed to load metadata for %s: %s", book_id, exc)
+        logging.warning(
+            "[page_expand] failed to load metadata for %s: %s", book_id, exc
+        )
         return None
 
 
@@ -519,7 +602,7 @@ def load_page_content(book_id: str, page_number: int) -> str | None:
     return (entry.get("full_content") or "").strip() or None
 
 
-@time_it
+@log_process
 def expand_to_pages(top_chunks: list[dict]) -> list[str]:
     """
     Step 7: Expands top ranked chunks to full page content from metadata.
@@ -543,30 +626,32 @@ def expand_to_pages(top_chunks: list[dict]) -> list[str]:
         return []
 
     page_blocks: list[str] = []
-    fetched_pages: set[tuple[str, int]] = set()   # (book_id, page_number) dedup
+    fetched_pages: set[tuple[str, int]] = set()  # (book_id, page_number) dedup
 
     def _fetch(book_id: str, page_num: int) -> str | None:
         if page_num < 0:
             return None
         key = (book_id, page_num)
         if key in fetched_pages:
-            return None   # already included — skip
+            return None  # already included — skip
         fetched_pages.add(key)
         return load_page_content(book_id, page_num)
 
     # ── Rank-1: 3-page expansion (N-1, N, N+1) ───────────────────────────────
     rank1 = top_chunks[0]
-    bid1  = rank1.get("book_id") or ""
-    pr1   = rank1.get("page_range") or [0, 0]
-    n1    = int(pr1[0]) if pr1 else 0
+    bid1 = rank1.get("book_id") or ""
+    pr1 = rank1.get("page_range") or [0, 0]
+    n1 = int(pr1[0]) if pr1 else 0
 
     if bid1 and n1 > 0:
-        prev_content = _fetch(bid1, n1 - 1)   # N-1: intro/heading context
-        main_content = _fetch(bid1, n1)        # N:   primary answer page
-        next_content = _fetch(bid1, n1 + 1)   # N+1: table continuation
+        prev_content = _fetch(bid1, n1 - 1)  # N-1: intro/heading context
+        main_content = _fetch(bid1, n1)  # N:   primary answer page
+        next_content = _fetch(bid1, n1 + 1)  # N+1: table continuation
 
         # Enforce combined character budget
-        combined_len = sum(len(c) for c in [prev_content, main_content, next_content] if c)
+        combined_len = sum(
+            len(c) for c in [prev_content, main_content, next_content] if c
+        )
 
         if combined_len > PAGE_EXPAND_MAX_CHARS:
             # Drop N-1 first (least critical of the three)
@@ -594,12 +679,12 @@ def expand_to_pages(top_chunks: list[dict]) -> list[str]:
     # ── Rank-2: single page only ──────────────────────────────────────────────
     if len(top_chunks) >= 2:
         rank2 = top_chunks[1]
-        bid2  = rank2.get("book_id") or ""
-        pr2   = rank2.get("page_range") or [0, 0]
-        n2    = int(pr2[0]) if pr2 else 0
+        bid2 = rank2.get("book_id") or ""
+        pr2 = rank2.get("page_range") or [0, 0]
+        n2 = int(pr2[0]) if pr2 else 0
 
         if bid2 and n2 > 0:
-            rank2_content = _fetch(bid2, n2)   # dedup: skips if page already fetched
+            rank2_content = _fetch(bid2, n2)  # dedup: skips if page already fetched
             if rank2_content:
                 page_blocks.append(rank2_content)
 
@@ -610,20 +695,23 @@ def expand_to_pages(top_chunks: list[dict]) -> list[str]:
 # CONTEXT BUILDING  ← modified to accept page_blocks
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 @time_it
 def _sentences(text: str) -> list[str]:
     try:
         import nltk
+
         p = PORTABLE_DIR / "nltk_data"
         if p.exists() and str(p) not in nltk.data.path:
             nltk.data.path.insert(0, str(p))
         from nltk.tokenize import sent_tokenize
+
         return sent_tokenize(text)
     except Exception:
         return [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
 
 
-@time_it
+@log_process
 def build_context(
     chunks: list[dict],
     query: str,
@@ -678,16 +766,16 @@ def build_context(
 
     # Tables first — never cut off mid-table
     table_chunks = [c for c in fallback_chunks if c.get("chunk_type") == "table"]
-    text_chunks  = [c for c in fallback_chunks if c.get("chunk_type") != "table"]
-    ordered      = table_chunks + text_chunks
+    text_chunks = [c for c in fallback_chunks if c.get("chunk_type") != "table"]
+    ordered = table_chunks + text_chunks
 
     ce = None
 
     for c in ordered:
         chunk_type = c.get("chunk_type", "text")
-        pr         = c.get("page_range") or [0, 0]
-        bid        = c.get("book_id") or "?"
-        path_s     = " > ".join(c.get("section_path") or [])
+        pr = c.get("page_range") or [0, 0]
+        bid = c.get("book_id") or "?"
+        path_s = " > ".join(c.get("section_path") or [])
 
         if chunk_type == "table":
             block = format_table_for_llm(c)
@@ -698,7 +786,7 @@ def build_context(
             if not block:
                 continue
             if total + len(block) > max_chars:
-                continue   # skip partial tables — partial data is worse than none
+                continue  # skip partial tables — partial data is worse than none
 
         else:
             text = (c.get("text") or "").strip()
@@ -737,7 +825,7 @@ def build_context(
                         block = label + segs[0][:4000]
 
             if total + len(block) > max_chars:
-                block = block[:max(0, max_chars - total)]
+                block = block[: max(0, max_chars - total)]
 
         parts.append(block)
         total += len(block)
@@ -751,23 +839,28 @@ def build_context(
 # MAIN RETRIEVAL + STREAMING
 # ─────────────────────────────────────────────────────────────────────────────
 
-@time_it
+
+@log_process
 def retrieve_bundle(query: str, book_ids: list[str], mode: str) -> dict[str, Any]:
-    cfg      = MODE_CONFIG.get(mode, MODE_CONFIG["balanced"])
+    cfg = MODE_CONFIG.get(mode, MODE_CONFIG["balanced"])
     prop_lim = cfg.get("prop_retrieve_limit", PROP_RETRIEVE_LIMIT)
     sect_lim = cfg.get("sect_retrieve_limit", SECT_RETRIEVE_LIMIT)
 
     # Steps 1-6: unchanged
-    prop_hits           = search_propositions(query, book_ids, prop_lim)
-    entity_terms        = extract_query_entities(query)
+    prop_hits = search_propositions(query, book_ids, prop_lim)
+    entity_terms = extract_query_entities(query)
     neo4j_section_names = neo4j_sections_for_entities(book_ids, entity_terms)
-    specs               = neo4j_specs_for_terms(book_ids, entity_terms)
+    specs = neo4j_specs_for_terms(book_ids, entity_terms)
 
-    parent_chunk_ids = list({p["parent_chunk_id"] for p in prop_hits if p.get("parent_chunk_id")})
-    parent_sections  = fetch_sections_by_chunk_ids(parent_chunk_ids, book_ids)
-    direct_sections  = search_sections_direct(query, book_ids, neo4j_section_names, sect_lim)
-    candidates       = merge_candidates(parent_sections, direct_sections, neo4j_section_names)
-    top              = rerank_candidates(query, candidates, cfg["final_top_n"])
+    parent_chunk_ids = list(
+        {p["parent_chunk_id"] for p in prop_hits if p.get("parent_chunk_id")}
+    )
+    parent_sections = fetch_sections_by_chunk_ids(parent_chunk_ids, book_ids)
+    direct_sections = search_sections_direct(
+        query, book_ids, neo4j_section_names, sect_lim
+    )
+    candidates = merge_candidates(parent_sections, direct_sections, neo4j_section_names)
+    top = rerank_candidates(query, candidates, cfg["final_top_n"])
 
     # Step 7: Page expansion — NEW
     # expand_to_pages() returns [] gracefully if metadata not found,
@@ -776,22 +869,30 @@ def retrieve_bundle(query: str, book_ids: list[str], mode: str) -> dict[str, Any
     page_blocks = expand_to_pages(top)
 
     # Step 8: Build context
-    context       = build_context(top, query, specs, cfg["context_max_chars"], page_blocks)
+    context = build_context(top, query, specs, cfg["context_max_chars"], page_blocks)
     system_prompt = get_system_prompt(mode)
 
-    sources = [{
-        "chunk_id":     c.get("chunk_id"),
-        "book_id":      c.get("book_id"),
-        "page_range":   c.get("page_range"),
-        "section_path": c.get("section_path"),
-        "chunk_type":   c.get("chunk_type"),
-        "from_qdrant":  c.get("from_qdrant"),
-        "from_neo4j":   c.get("from_neo4j"),
-        "rerank_score": round(c.get("rerank_score", 0.0), 4),
-    } for c in top]
+    sources = [
+        {
+            "chunk_id": c.get("chunk_id"),
+            "book_id": c.get("book_id"),
+            "page_range": c.get("page_range"),
+            "section_path": c.get("section_path"),
+            "chunk_type": c.get("chunk_type"),
+            "from_qdrant": c.get("from_qdrant"),
+            "from_neo4j": c.get("from_neo4j"),
+            "rerank_score": round(c.get("rerank_score", 0.0), 4),
+        }
+        for c in top
+    ]
 
-    return {"context": context, "sources": sources,
-            "system_prompt": system_prompt, "mode": mode, "cfg": cfg}
+    return {
+        "context": context,
+        "sources": sources,
+        "system_prompt": system_prompt,
+        "mode": mode,
+        "cfg": cfg,
+    }
 
 
 @time_it
@@ -808,7 +909,7 @@ def build_user_message(query: str, context: str, history: list[dict]) -> str:
     Adds an explicit per-message reminder to never reference tables.
     Redundancy with system prompt is intentional and effective.
     """
-    query   = query   or ""
+    query = query or ""
     context = context or ""
     reminder = (
         "\n\nIMPORTANT: Your answer must be COMPLETE and SELF-CONTAINED. "
@@ -820,31 +921,45 @@ def build_user_message(query: str, context: str, history: list[dict]) -> str:
     )
     hb = (_history_block(history) or "").strip()
     if hb:
-        return (f"Conversation so far:\n{hb}\n\n"
-                f"Context from knowledge base:\n{context}\n\n"
-                f"Current question: {query}{reminder}\nAnswer:")
-    return (f"Context from knowledge base:\n{context}\n\n"
-            f"Question: {query}{reminder}\nAnswer:")
+        return (
+            f"Conversation so far:\n{hb}\n\n"
+            f"Context from knowledge base:\n{context}\n\n"
+            f"Current question: {query}{reminder}\nAnswer:"
+        )
+    return (
+        f"Context from knowledge base:\n{context}\n\n"
+        f"Question: {query}{reminder}\nAnswer:"
+    )
 
 
 async def run_rag_stream(
-    query: str, book_ids: list[str], mode: str, history: list[dict],
+    query: str,
+    book_ids: list[str],
+    mode: str,
+    history: list[dict],
 ) -> AsyncIterator[dict]:
     yield {"type": "status", "message": "Searching knowledge base..."}
+    logger.info("RAG query | mode=%s | books=%s | query=%.80s", mode, book_ids, query)
     loop = asyncio.get_running_loop()
+    t0 = time.perf_counter()
     try:
-        bundle = await loop.run_in_executor(None, lambda: retrieve_bundle(query, book_ids, mode))
+        bundle = await loop.run_in_executor(
+            None, lambda: retrieve_bundle(query, book_ids, mode)
+        )
     except Exception as e:
+        logger.error("retrieve_bundle failed: %s", e)
         yield {"type": "error", "message": str(e)}
         return
+    logger.info("retrieve_bundle complete in %.3fs", time.perf_counter() - t0)
 
     yield {"type": "status", "message": "Generating answer..."}
     user_content = build_user_message(query, bundle["context"], history)
     messages = [
         {"role": "system", "content": bundle["system_prompt"]},
-        {"role": "user",   "content": user_content},
+        {"role": "user", "content": user_content},
     ]
     from partb.llm.stream_client import stream_llm
+
     full = ""
     had_error = False
     try:
@@ -860,4 +975,9 @@ async def run_rag_stream(
         yield {"type": "error", "message": str(e)}
         return
     if not had_error:
-        yield {"type": "done", "sources": bundle["sources"], "mode": mode, "full_text": full}
+        yield {
+            "type": "done",
+            "sources": bundle["sources"],
+            "mode": mode,
+            "full_text": full,
+        }

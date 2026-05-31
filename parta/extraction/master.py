@@ -14,24 +14,26 @@ All worker management, fault tolerance, and retries are handled
 inside extraction_server.py — this file has no worker logic.
 """
 
-import requests
-from parta.logger import time_it, async_time_it
 import time
 from pathlib import Path
+
+import requests
+
+from parta.logger import log_process, logger, time_it
 
 # ── Config ────────────────────────────────────────────────────────────────────
 # URL of extraction_server.py running on Master Node port 8004
 EXTRACTION_SERVER_URL = "http://localhost:8004"
-POLL_INTERVAL_SEC     = 5
+POLL_INTERVAL_SEC = 5
 
 
-@time_it
+@log_process
 def run_extraction(
-    book_id:           str,
-    pdf_path:          str,
-    base_dir:          str,
-    progress_callback = None,
-    ocr_enabled:       bool = False,
+    book_id: str,
+    pdf_path: str,
+    base_dir: str,
+    progress_callback=None,
+    ocr_enabled: bool = False,
 ) -> str:
     """
     Called by pipeline_controller.
@@ -45,7 +47,7 @@ def run_extraction(
     processed_dir.mkdir(parents=True, exist_ok=True)
     output_file = processed_dir / f"{book_id}.md"
 
-    print(f"\n[EXTRACT] Starting extraction for: {book_id}")
+    logger.info("Starting extraction for: %s", book_id)
 
     # ── Step 1: Tell extraction server to split and queue the PDF ─────────────
     if progress_callback:
@@ -59,9 +61,9 @@ def run_extraction(
         resp = requests.post(
             f"{EXTRACTION_SERVER_URL}/start_extraction",
             json={
-                "book_id":     book_id,
-                "pdf_path":    pdf_path,
-                "base_dir":    base_dir,
+                "book_id": book_id,
+                "pdf_path": pdf_path,
+                "base_dir": base_dir,
                 "ocr_enabled": ocr_enabled,
             },
             timeout=60,
@@ -77,20 +79,21 @@ def run_extraction(
             f"Extraction server rejected start: {resp.status_code} — {resp.text}"
         )
 
-    data         = resp.json()
+    data = resp.json()
     total_chunks = data.get("total_chunks", 1)
-    total_pages  = data.get("total_pages",  0)
+    total_pages = data.get("total_pages", 0)
 
     mode_label = "OCR" if ocr_enabled else "fast"
-    print(f"[EXTRACT] {total_chunks} chunks queued "
-          f"({total_pages} pages total, mode={mode_label})")
+    logger.info(
+        "%d chunks queued (%d pages, mode=%s)", total_chunks, total_pages, mode_label
+    )
 
     if progress_callback:
         progress_callback(
             percent=10,
             stage="Text Extraction",
             message=f"Queued {total_chunks} chunks "
-                    f"({total_pages} pages, {mode_label}). Workers processing...",
+            f"({total_pages} pages, {mode_label}). Workers processing...",
         )
 
     # ── Step 2: Poll until all chunks are done ────────────────────────────────
@@ -106,15 +109,20 @@ def run_extraction(
             )
             status = status_resp.json()
         except Exception as e:
-            print(f"[EXTRACT] ⚠ Could not poll status: {e}. Retrying...")
+            logger.warning("Could not poll extraction status: %s — retrying...", e)
             continue
 
-        completed   = status.get("completed",   0)
+        completed = status.get("completed", 0)
         is_finished = status.get("is_finished", False)
-        overall     = status.get("status",      "running")
-        elapsed     = int(time.time() - t_start)
+        overall = status.get("status", "running")
+        elapsed = int(time.time() - t_start)
 
-        print(f"[EXTRACT] {completed}/{total_chunks} chunks done | {elapsed}s elapsed")
+        logger.info(
+            "Extraction progress: %d/%d chunks done | %ds elapsed",
+            completed,
+            total_chunks,
+            elapsed,
+        )
 
         if progress_callback:
             ui_pct = 10 + int(completed / max(total_chunks, 1) * 39)
@@ -162,7 +170,7 @@ def run_extraction(
         f.write(full_text)
 
     elapsed = int(time.time() - t_start)
-    print(f"[EXTRACT] ✅ Done in {elapsed}s → {output_file}")
+    logger.info("Extraction complete in %ds → %s", elapsed, output_file)
 
     if progress_callback:
         progress_callback(

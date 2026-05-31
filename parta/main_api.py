@@ -29,42 +29,42 @@ Run with: uvicorn main_api:app --host 0.0.0.0 --port 8000
 import os
 import sys
 from pathlib import Path
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from parta.logger import time_it, async_time_it
-import re
-import uuid
+import asyncio
+import json
 import queue
+import re
 import threading
 import time
-import json
-import asyncio
+import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from datetime import datetime, timezone, timedelta
-
-from fastapi import FastAPI, UploadFile, File, Form, Depends, HTTPException, Request
-from fastapi.responses import StreamingResponse, HTMLResponse, JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
-
-from pymongo import MongoClient
-from pymongo.errors import DuplicateKeyError
 
 import bcrypt
 import jwt as pyjwt
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
+from pymongo import MongoClient
+from pymongo.errors import DuplicateKeyError
+
+from parta.logger import async_time_it, logger, time_it
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-BASE_DIR     = Path(__file__).resolve().parent
+BASE_DIR = Path(__file__).resolve().parent
 DATA_RAW_DIR = BASE_DIR / "data" / "raw"
 DATA_RAW_DIR.mkdir(parents=True, exist_ok=True)
 
-MONGO_URI        = "mongodb+srv://redrepter:ncq4fIo18UK948dV@krutrim.li124fs.mongodb.net/?appName=krutrim"
-MONGO_DB_NAME    = "rag_system"
+MONGO_URI = "mongodb+srv://redrepter:ncq4fIo18UK948dV@krutrim.li124fs.mongodb.net/?appName=krutrim"
+MONGO_DB_NAME = "rag_system"
 
-JWT_SECRET       = "ISRO_RAG_SECRET_CHANGE_IN_PROD"
-JWT_ALGORITHM    = "HS256"
+JWT_SECRET = "ISRO_RAG_SECRET_CHANGE_IN_PROD"
+JWT_ALGORITHM = "HS256"
 JWT_EXPIRE_HOURS = 8
 
 # Statuses that mean a pipeline is already active for this book
@@ -82,10 +82,10 @@ TERMINAL_STATUSES = ("completed", "extraction_failed", "ingestion_failed")
 # Database
 # ---------------------------------------------------------------------------
 mongo_client = MongoClient(MONGO_URI)
-mongo_db     = mongo_client[MONGO_DB_NAME]
-users_col    = mongo_db["users"]
-jobs_col     = mongo_db["jobs"]
-library_col  = mongo_db["library"]
+mongo_db = mongo_client[MONGO_DB_NAME]
+users_col = mongo_db["users"]
+jobs_col = mongo_db["jobs"]
+library_col = mongo_db["library"]
 
 users_col.create_index("email", unique=True)
 jobs_col.create_index("job_id", unique=True)
@@ -114,13 +114,14 @@ if frontend_dir.exists():
 # JWT helpers
 # ---------------------------------------------------------------------------
 
+
 @time_it
 def create_token(user_id: str, name: str, email: str) -> str:
     payload = {
         "user_id": user_id,
-        "name":    name,
-        "email":   email,
-        "exp":     datetime.now(timezone.utc) + timedelta(hours=JWT_EXPIRE_HOURS),
+        "name": name,
+        "email": email,
+        "exp": datetime.now(timezone.utc) + timedelta(hours=JWT_EXPIRE_HOURS),
     }
     return pyjwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
 
@@ -151,13 +152,16 @@ def queue_worker():
     Background thread — picks jobs one at a time.
     phase2_only jobs call run_phase2 directly (resume path).
     """
-    from pipeline_controller import run_pipeline, run_phase2
+    from pipeline_controller import run_phase2, run_pipeline
+
     while True:
         try:
             job = pipeline_queue.get(block=True, timeout=5)
-            print(
-                f"[QUEUE] Job {job['job_id']} | book: {job['book_id']} "
-                f"| phase: {job.get('phase', 'full')}"
+            logger.info(
+                "Queue job | id=%s | book=%s | phase=%s",
+                job["job_id"],
+                job["book_id"],
+                job.get("phase", "full"),
             )
             try:
                 if job.get("phase") == "phase2_only":
@@ -165,7 +169,7 @@ def queue_worker():
                 else:
                     run_pipeline(job, jobs_col, mongo_db)
             except Exception as e:
-                print(f"[QUEUE] Unhandled error for {job['job_id']}: {e}")
+                logger.error("Unhandled queue error for %s: %s", job["job_id"], e)
             finally:
                 pipeline_queue.task_done()
         except queue.Empty:
@@ -173,12 +177,13 @@ def queue_worker():
 
 
 threading.Thread(target=queue_worker, daemon=True).start()
-print("[MAIN API] ✅ Background queue worker started.")
+logger.info("Background queue worker started.")
 
 
 # ---------------------------------------------------------------------------
 # Routes: frontend
 # ---------------------------------------------------------------------------
+
 
 @app.get("/", response_class=HTMLResponse)
 @time_it
@@ -193,11 +198,12 @@ def serve_frontend():
 # Routes: auth
 # ---------------------------------------------------------------------------
 
+
 @app.post("/auth/signup")
 @time_it
 def signup(body: dict):
-    name     = body.get("name", "").strip()
-    email    = body.get("email", "").strip().lower()
+    name = body.get("name", "").strip()
+    email = body.get("email", "").strip().lower()
     password = body.get("password", "")
 
     if not name or not email or not password:
@@ -207,18 +213,20 @@ def signup(body: dict):
     if "@" not in email:
         raise HTTPException(400, "Invalid email address.")
 
-    hashed  = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+    hashed = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
     user_id = str(uuid.uuid4())
 
     try:
-        users_col.insert_one({
-            "user_id":    user_id,
-            "name":       name,
-            "email":      email,
-            "password":   hashed,
-            "role":       "admin",
-            "created_at": datetime.now(timezone.utc).isoformat(),
-        })
+        users_col.insert_one(
+            {
+                "user_id": user_id,
+                "name": name,
+                "email": email,
+                "password": hashed,
+                "role": "admin",
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            }
+        )
     except DuplicateKeyError:
         raise HTTPException(409, "An account with this email already exists.")
 
@@ -228,7 +236,7 @@ def signup(body: dict):
 @app.post("/auth/login")
 @time_it
 def login(body: dict):
-    email    = body.get("email", "").strip().lower()
+    email = body.get("email", "").strip().lower()
     password = body.get("password", "")
 
     user = users_col.find_one({"email": email}, {"_id": 0})
@@ -238,10 +246,10 @@ def login(body: dict):
     token = create_token(user["user_id"], user["name"], user["email"])
     return {
         "token": token,
-        "user":  {
+        "user": {
             "user_id": user["user_id"],
-            "name":    user["name"],
-            "email":   user["email"],
+            "name": user["name"],
+            "email": user["email"],
         },
     }
 
@@ -250,89 +258,102 @@ def login(body: dict):
 # Routes: book upload
 # ---------------------------------------------------------------------------
 
+
 @app.get("/library/check")
 @time_it
 def check_book_id(book_id: str, user=Depends(verify_token)):
-    exists  = library_col.find_one({"book_id": book_id}) is not None
-    running = jobs_col.find_one(
-        {"book_id": book_id, "status": {"$in": list(ACTIVE_STATUSES)}}
-    ) is not None
+    exists = library_col.find_one({"book_id": book_id}) is not None
+    running = (
+        jobs_col.find_one(
+            {"book_id": book_id, "status": {"$in": list(ACTIVE_STATUSES)}}
+        )
+        is not None
+    )
     return {"book_id": book_id, "exists": exists, "running": running}
 
 
 @app.post("/upload_book")
 @async_time_it
 async def upload_book(
-    book_id: str        = Form(...),
-    file:    UploadFile = File(...),
-    user:    dict       = Depends(verify_token),
+    book_id: str = Form(...),
+    file: UploadFile = File(...),
+    user: dict = Depends(verify_token),
 ):
-    if not re.match(r'^[A-Za-z0-9_\-]+$', book_id):
+    if not re.match(r"^[A-Za-z0-9_\-]+$", book_id):
         raise HTTPException(
-            400,
-            "Book ID can only contain letters, numbers, hyphens, and underscores."
+            400, "Book ID can only contain letters, numbers, hyphens, and underscores."
         )
 
     if library_col.find_one({"book_id": book_id}):
         raise HTTPException(409, f"Book ID '{book_id}' already exists in the library.")
 
-    if jobs_col.find_one({"book_id": book_id, "status": {"$in": list(ACTIVE_STATUSES)}}):
+    if jobs_col.find_one(
+        {"book_id": book_id, "status": {"$in": list(ACTIVE_STATUSES)}}
+    ):
         raise HTTPException(409, f"A job for '{book_id}' is already in progress.")
 
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(400, "Only PDF files are accepted.")
 
     pdf_path = DATA_RAW_DIR / f"{book_id}.pdf"
-    content  = await file.read()
+    content = await file.read()
     with open(pdf_path, "wb") as fh:
         fh.write(content)
 
-    job_id         = str(uuid.uuid4())
+    job_id = str(uuid.uuid4())
     queue_position = pipeline_queue.qsize() + 1
 
     job_doc = {
-        "job_id":            job_id,
-        "book_id":           book_id,
-        "uploaded_by":       user["user_id"],
-        "uploaded_by_name":  user.get("name", ""),
-        "status":            "queued",
-        "percent":           0,
-        "stage":             "Queued",
-        "message":           f"Position {queue_position} in queue",
-        "queue_position":    queue_position,
+        "job_id": job_id,
+        "book_id": book_id,
+        "uploaded_by": user["user_id"],
+        "uploaded_by_name": user.get("name", ""),
+        "status": "queued",
+        "percent": 0,
+        "stage": "Queued",
+        "message": f"Position {queue_position} in queue",
+        "queue_position": queue_position,
         # Checkpoint paths — written by Phase 1 before Phase 2 starts
-        "ready_path":        None,
-        "prop_path":         None,
-        "qdrant_progress":   {"status": "pending", "percent": 0},
-        "neo4j_progress":    {"status": "pending", "percent": 0},
+        "ready_path": None,
+        "prop_path": None,
+        "qdrant_progress": {"status": "pending", "percent": 0},
+        "neo4j_progress": {"status": "pending", "percent": 0},
         "confidence_report": None,
-        "started_at":        None,
-        "updated_at":        datetime.now(timezone.utc).isoformat(),
-        "completed_at":      None,
-        "error":             None,
+        "started_at": None,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "completed_at": None,
+        "error": None,
     }
     jobs_col.insert_one(job_doc)
 
-    pipeline_queue.put({
-        "job_id":   job_id,
-        "book_id":  book_id,
-        "pdf_path": str(pdf_path),
-        "user_id":  user["user_id"],
-    })
+    pipeline_queue.put(
+        {
+            "job_id": job_id,
+            "book_id": book_id,
+            "pdf_path": str(pdf_path),
+            "user_id": user["user_id"],
+        }
+    )
 
-    print(f"[API] Upload: {book_id} | Job: {job_id} | Queue pos: {queue_position}")
+    logger.info(
+        "Upload accepted | book=%s | job=%s | queue_pos=%d",
+        book_id,
+        job_id,
+        queue_position,
+    )
     return {
-        "job_id":         job_id,
-        "book_id":        book_id,
-        "status":         "queued",
+        "job_id": job_id,
+        "book_id": book_id,
+        "status": "queued",
         "queue_position": queue_position,
-        "message":        "Upload received. Pipeline will start shortly.",
+        "message": "Upload received. Pipeline will start shortly.",
     }
 
 
 # ---------------------------------------------------------------------------
 # Routes: SSE progress stream
 # ---------------------------------------------------------------------------
+
 
 @app.get("/progress/{job_id}")
 @async_time_it
@@ -353,16 +374,16 @@ async def progress_stream(job_id: str, request: Request):
                 return
 
             payload = {
-                "job_id":            doc.get("job_id"),
-                "book_id":           doc.get("book_id"),
-                "status":            doc.get("status"),
-                "percent":           doc.get("percent", 0),
-                "stage":             doc.get("stage", ""),
-                "message":           doc.get("message", ""),
-                "qdrant_progress":   doc.get("qdrant_progress", {}),
-                "neo4j_progress":    doc.get("neo4j_progress", {}),
+                "job_id": doc.get("job_id"),
+                "book_id": doc.get("book_id"),
+                "status": doc.get("status"),
+                "percent": doc.get("percent", 0),
+                "stage": doc.get("stage", ""),
+                "message": doc.get("message", ""),
+                "qdrant_progress": doc.get("qdrant_progress", {}),
+                "neo4j_progress": doc.get("neo4j_progress", {}),
                 "confidence_report": doc.get("confidence_report"),
-                "error":             doc.get("error"),
+                "error": doc.get("error"),
             }
             yield f"data: {json.dumps(payload)}\n\n"
 
@@ -375,8 +396,8 @@ async def progress_stream(job_id: str, request: Request):
         event_generator(),
         media_type="text/event-stream",
         headers={
-            "Cache-Control":               "no-cache",
-            "X-Accel-Buffering":           "no",
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
             "Access-Control-Allow-Origin": "*",
         },
     )
@@ -386,6 +407,7 @@ async def progress_stream(job_id: str, request: Request):
 # Routes: pending jobs + resume
 # ---------------------------------------------------------------------------
 
+
 @app.get("/pending_jobs")
 @time_it
 def pending_jobs(user=Depends(verify_token)):
@@ -393,10 +415,12 @@ def pending_jobs(user=Depends(verify_token)):
     Returns jobs in resumable states (extraction_done or ingestion_failed).
     These can be re-queued via POST /resume/{job_id}.
     """
-    docs = list(jobs_col.find(
-        {"status": {"$in": list(RESUMABLE_STATUSES)}},
-        {"_id": 0, "password": 0},
-    ))
+    docs = list(
+        jobs_col.find(
+            {"status": {"$in": list(RESUMABLE_STATUSES)}},
+            {"_id": 0, "password": 0},
+        )
+    )
     for d in docs:
         d.pop("confidence_report", None)
     return {"jobs": docs, "count": len(docs)}
@@ -428,19 +452,19 @@ def resume_job(job_id: str, user=Depends(verify_token)):
         raise HTTPException(
             400,
             f"Job '{job_id}' is not resumable (status: {doc['status']}). "
-            f"Only jobs with status {RESUMABLE_STATUSES} can be resumed."
+            f"Only jobs with status {RESUMABLE_STATUSES} can be resumed.",
         )
 
     # FIX: read the correct field names
     ready_path = doc.get("ready_path", "")
-    prop_path  = doc.get("prop_path",  "")
+    prop_path = doc.get("prop_path", "")
 
     if not ready_path or not prop_path:
         raise HTTPException(
             400,
             f"Job '{job_id}' has no checkpoint paths recorded. "
             "Phase 1 may not have completed successfully. "
-            "Check that ready_path and prop_path are saved on the job document."
+            "Check that ready_path and prop_path are saved on the job document.",
         )
 
     # Verify both files exist on disk
@@ -454,21 +478,23 @@ def resume_job(job_id: str, user=Depends(verify_token)):
             400,
             "Checkpoint file(s) not found on disk: "
             + ", ".join(missing)
-            + ". Phase 1 must be re-run before resuming."
+            + ". Phase 1 must be re-run before resuming.",
         )
 
     # Build the progress reset:
     # Stages already "done" keep their status — Phase 2 will skip them.
     # Stages that "failed" or "pending" are reset to pending for a fresh attempt.
     current_qdrant = doc.get("qdrant_progress", {})
-    current_neo4j  = doc.get("neo4j_progress",  {})
+    current_neo4j = doc.get("neo4j_progress", {})
 
     new_qdrant = (
-        current_qdrant if current_qdrant.get("status") == "done"
+        current_qdrant
+        if current_qdrant.get("status") == "done"
         else {"status": "pending", "percent": 0}
     )
     new_neo4j = (
-        current_neo4j if current_neo4j.get("status") == "done"
+        current_neo4j
+        if current_neo4j.get("status") == "done"
         else {"status": "pending", "percent": 0}
     )
 
@@ -491,37 +517,44 @@ def resume_job(job_id: str, user=Depends(verify_token)):
 
     jobs_col.update_one(
         {"job_id": job_id},
-        {"$set": {
-            "status":          "queued",
-            "percent":         65,
-            "stage":           "Queued for ingestion",
-            "message":         resume_msg,
-            "error":           None,
-            "qdrant_progress": new_qdrant,
-            "neo4j_progress":  new_neo4j,
-            "updated_at":      datetime.now(timezone.utc).isoformat(),
-        }}
+        {
+            "$set": {
+                "status": "queued",
+                "percent": 65,
+                "stage": "Queued for ingestion",
+                "message": resume_msg,
+                "error": None,
+                "qdrant_progress": new_qdrant,
+                "neo4j_progress": new_neo4j,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+        },
     )
 
-    pipeline_queue.put({
-        "job_id":     job_id,
-        "book_id":    doc["book_id"],
-        "pdf_path":   str(DATA_RAW_DIR / f"{doc['book_id']}.pdf"),
-        "user_id":    doc.get("uploaded_by", ""),
-        "ready_path": ready_path,
-        "prop_path":  prop_path,
-        "phase":      "phase2_only",
-    })
+    pipeline_queue.put(
+        {
+            "job_id": job_id,
+            "book_id": doc["book_id"],
+            "pdf_path": str(DATA_RAW_DIR / f"{doc['book_id']}.pdf"),
+            "user_id": doc.get("uploaded_by", ""),
+            "ready_path": ready_path,
+            "prop_path": prop_path,
+            "phase": "phase2_only",
+        }
+    )
 
-    print(
-        f"[API] Resume: {doc['book_id']} | Job: {job_id} | "
-        f"resuming: {resuming} | skipping: {skipping}"
+    logger.info(
+        "Resume queued | book=%s | job=%s | resuming=%s | skipping=%s",
+        doc["book_id"],
+        job_id,
+        resuming,
+        skipping,
     )
     return {
-        "job_id":   job_id,
-        "book_id":  doc["book_id"],
-        "status":   "queued",
-        "message":  resume_msg,
+        "job_id": job_id,
+        "book_id": doc["book_id"],
+        "status": "queued",
+        "message": resume_msg,
         "resuming": resuming,
         "skipping": skipping,
     }
@@ -530,6 +563,7 @@ def resume_job(job_id: str, user=Depends(verify_token)):
 # ---------------------------------------------------------------------------
 # Routes: library + job status
 # ---------------------------------------------------------------------------
+
 
 @app.get("/library")
 @time_it
@@ -551,13 +585,14 @@ def get_job_status(job_id: str, user=Depends(verify_token)):
 # Health check
 # ---------------------------------------------------------------------------
 
+
 @app.get("/health")
 @time_it
 def health():
     return {
-        "status":     "ok",
+        "status": "ok",
         "queue_size": pipeline_queue.qsize(),
-        "mongo":      "connected",
+        "mongo": "connected",
     }
 
 
@@ -567,4 +602,5 @@ def health():
 
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run(app, host="0.0.0.0", port=8000, reload=False)
