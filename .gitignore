@@ -2,3 +2,7 @@ __pycache__
 portable
 .logs/
 data/
+wheel
+*.rar
+*bat
+*exe
