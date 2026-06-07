@@ -569,31 +569,41 @@ def _write_cooccurrence_batch(
     print(f"[NEO4J] Layer 4: Writing {len(cooccurrence)} "
           f"sentence co-occurrence edges...")
 
-    written = 0
+    batch = []
     for (name_a, name_b), data in cooccurrence.items():
-        sections_list = list(data["sections"])[:20]  # cap at 20 section names
+        batch.append({
+            "na": name_a,
+            "nb": name_b,
+            "cnt": data["count"],
+            "secs": list(data["sections"])[:20]
+        })
 
+    if not batch:
+        return
+
+    chunk_size = 500
+    written = 0
+    for i in range(0, len(batch), chunk_size):
+        chunk = batch[i:i + chunk_size]
         session.run(
             """
-            MATCH (a:Entity {name: $na, book_id: $bid})
-            MATCH (b:Entity {name: $nb, book_id: $bid})
+            UNWIND $batch AS row
+            MATCH (a:Entity {name: row.na, book_id: $bid})
+            MATCH (b:Entity {name: row.nb, book_id: $bid})
             MERGE (a)-[r:SENTENCE_CO_OCCURS]->(b)
             ON CREATE SET
-                r.count    = $cnt,
-                r.sections = $secs
+                r.count    = row.cnt,
+                r.sections = row.secs
             ON MATCH SET
-                r.count    = r.count + $cnt,
-                r.sections = r.sections + $secs
+                r.count    = r.count + row.cnt,
+                r.sections = r.sections + row.secs
             """,
             bid=book_id,
-            na=name_a,
-            nb=name_b,
-            cnt=data["count"],
-            secs=sections_list,
+            batch=chunk
         )
-        written += 1
+        written += len(chunk)
 
-    print(f"[NEO4J] ✅ Layer 4 done — {written} co-occurrence edges written")
+    print(f"[NEO4J] ✅ Layer 4 done — {written} co-occurrence edges written in batch")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
