@@ -73,8 +73,8 @@ logging.getLogger("transformers").setLevel(logging.ERROR)
 # ─────────────────────────────────────────────────────────────────────────────
 # HARDCODED CONFIGURATION — no environment variables
 # ─────────────────────────────────────────────────────────────────────────────
-QDRANT_URL           = "https://ec85c2a8-9447-4153-852a-3ddb9f369324.australia-southeast1-0.gcp.cloud.qdrant.io"
-QDRANT_API_KEY       = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJhY2Nlc3MiOiJtIiwic3ViamVjdCI6ImFwaS1rZXk6YzE4OTkzYWYtNTJiNi00NjkwLWFkMWUtMjRjMzNiMmYyYWE1In0.eW0QstWU__d8fxEvi09i4YPLCPflkwjzKZNLPFpElGE"
+QDRANT_URL           = "https://9a5b0165-5dab-4d30-8b0c-95319c7c1191.us-east-2-0.aws.cloud.qdrant.io"
+QDRANT_API_KEY       = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJhY2Nlc3MiOiJtIiwic3ViamVjdCI6ImFwaS1rZXk6ODVhODM3MDEtYWYyMS00MWQ2LTgzOTItN2FmYWExZTQyNTI2In0.FYpoWi_q1lwgOs58R_OqsboC32qWhl60LJXv3Rtg4OY"
 COLLECTION_PROPS     = "RAG_PROPOSITIons"
 COLLECTION_SECTIONS  = "RAG_sections"
 EMBEDDING_DIM        = 768             # Nomic embed-text-v1.5 output size

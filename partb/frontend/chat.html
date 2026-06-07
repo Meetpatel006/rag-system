@@ -335,6 +335,7 @@ html, body { height: 100%; font-family: -apple-system, BlinkMacSystemFont, 'Sego
     .logo { text-align: center; margin-bottom: -28px; width: 225px; margin-left: 35px;}
     .logo img { height: 151px; width: auto; object-fit: contain; display: block; margin: 0 auto;width: 225px; margin-left: 35px; }
     .logo-main  { text-align: center; margin-bottom: -8px; width: 112px; margin-left: 28px; margin-right: -17px; }
+    .brand-logo { height: 32px; width: auto; object-fit: contain; display: block; }
 
 /* ── Login  ────────────────────────────────────── */
 #login-screen {
@@ -427,8 +428,8 @@ html, body { height: 100%; font-family: -apple-system, BlinkMacSystemFont, 'Sego
 <!-- ── Main App ──────────────────────────────────────────────── -->
 <div id="app" style="display:none;">
   <div id="brand-bar">
-  <div style="display:flex; slign-items: center; gap: 10px">
-    <img src= "/static/isro-logo.svg" class="logo" alt= "ISRO"
+  <div style="display:flex; align-items: center; gap: 10px">
+    <img src= "/static/isro-logo.svg" class="brand-logo" alt= "ISRO"
     onerror= "this.style.display='none'; if(this.nextElementSibling) this.nextElementSibling.style.display= 'block';">
     <span id= "health-indicator" style="font-size: 11px; color: #475569">-</span>
    </div>
