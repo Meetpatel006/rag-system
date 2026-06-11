@@ -1,15 +1,17 @@
 """
 extraction/extraction_server.py
 --------------------------------
-Pull-based PDF chunk extraction job server. Port 8004 on Master Node.
+Unified pull-based job server for:
+  - Extraction
+  - Neo4j ingestion
+  - Qdrant ingestion
 
 Architecture:
-  - Workers pull jobs — no hardcoded worker IPs on master
-  - Each job has a lease_deadline; expired lease returns chunk to PENDING
-  - No worker blacklist — dead workers stop polling, chunks time out naturally
-  - Binary chunk download via GET /chunk/{job_id} (no base64 overhead)
-  - Idempotent submit — late duplicate submits safely ignored
-  - Per-chunk attempt_count caps retries for genuinely corrupt PDF slices
+  - Workers pull jobs
+  - Each job has a lease_deadline
+  - Expired lease returns job to PENDING
+  - Idempotent submit_result
+  - Per-job attempt_count caps retries
 
 Run with:
     uvicorn extraction.extraction_server:app --host 0.0.0.0 --port 8004
@@ -17,15 +19,13 @@ Run with:
 
 import sys
 import uuid
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
-
 import shutil
 import threading
 import time
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Optional
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 import uvicorn
 from fastapi import FastAPI, HTTPException
@@ -34,30 +34,310 @@ from pypdf import PdfReader, PdfWriter
 
 from parta.logger import async_time_it, logger, time_it
 
-app = FastAPI(title="Extraction Job Server")
+app = FastAPI(title="Unified Job Server")
 
 # ── Config ────────────────────────────────────────────────────────────────────
-CHUNK_SIZE = 10  # pages per chunk sent to each worker
-LEASE_SECONDS = 600  # lease per chunk; expired → back to PENDING
-MAX_ATTEMPTS = 3  # per-chunk global cap (Bug C5: was 10, far too many)
-CLEANUP_DELAY_SEC = 300  # delete chunk files 5 min after book finishes
+CHUNK_SIZE = 10
+LEASE_SECONDS = 600
+MAX_ATTEMPTS = 3
+CLEANUP_DELAY_SEC = 300
 
 # ── In-memory state ───────────────────────────────────────────────────────────
+# Each store maps book_id -> state dict
 extractions: Dict[str, dict] = {}
-extraction_lock = threading.Lock()
+neo4j_jobs: Dict[str, dict] = {}
+qdrant_jobs: Dict[str, dict] = {}
+job_lock = threading.Lock()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# START EXTRACTION — called by pipeline_controller
+# Helpers
+# ─────────────────────────────────────────────────────────────────────────────
+def _job_row(
+    *,
+    job_id: str,
+    book_id: str,
+    job_kind: str,
+    status: str = "PENDING",
+    chunk_idx: Optional[int] = None,
+    start_offset: int = 0,
+    page_count: int = 0,
+    chunk_path: Optional[str] = None,
+    assigned_to: Optional[str] = None,
+    assigned_at: float = 0.0,
+    lease_deadline: float = 0.0,
+    attempt_count: int = 0,
+    result: Optional[str] = None,
+) -> dict:
+    return {
+        "job_id": job_id,
+        "book_id": book_id,
+        "job_kind": job_kind,
+        "chunk_idx": chunk_idx,
+        "start_offset": start_offset,
+        "page_count": page_count,
+        "chunk_path": chunk_path,
+        "status": status,
+        "assigned_to": assigned_to,
+        "assigned_at": assigned_at,
+        "lease_deadline": lease_deadline,
+        "attempt_count": attempt_count,
+        "result": result,
+    }
+
+
+def _new_book_state(*, total: int, meta: Optional[dict] = None) -> dict:
+    return {
+        "jobs": {},
+        "queue": [],
+        "total": total,
+        "completed": 0,
+        "failed": 0,
+        "is_finished": False,
+        "started_at": time.time(),
+        "meta": meta or {},
+    }
+
+
+def _reject_if_active(store: Dict[str, dict], book_id: str, label: str):
+    existing = store.get(book_id)
+    if existing and not existing["is_finished"]:
+        raise HTTPException(
+            409,
+            f"{label} for '{book_id}' is already running "
+            f"({existing['completed']}/{existing['total']} done).",
+        )
+
+
+def _finish_check(store: Dict[str, dict], book_id: str, cleanup_fn=None):
+    state = store.get(book_id)
+    if not state:
+        return
+
+    done = state["completed"] + state["failed"]
+    if done >= state["total"] and not state["is_finished"]:
+        state["is_finished"] = True
+        label = "FAILED" if state["failed"] > 0 else "COMPLETE"
+        logger.info(
+            "%s %s — '%s' (%d/%d)",
+            label,
+            state["meta"].get("label", "JOB"),
+            book_id,
+            state["completed"],
+            state["total"],
+        )
+        if cleanup_fn:
+            threading.Thread(
+                target=cleanup_fn,
+                args=(state["meta"],),
+                daemon=True,
+            ).start()
+
+
+def _single_job_state(*, book_id: str, job_kind: str, meta: Optional[dict] = None) -> dict:
+    jid = str(uuid.uuid4())
+    state = _new_book_state(total=1, meta={"label": job_kind.upper(), **(meta or {})})
+    state["jobs"][jid] = _job_row(job_id=jid, book_id=book_id, job_kind=job_kind)
+    state["queue"] = [jid]
+    return state
+
+
+def _make_wait_or_shutdown() -> dict:
+    # Keep workers alive for later jobs. No shutdown games.
+    return {"action": "WAIT"}
+
+
+def _assign_pending_job(
+    *,
+    store: Dict[str, dict],
+    worker_id: str,
+    expected_kind: Optional[str] = None,
+    extra_response: Optional[dict] = None,
+) -> dict:
+    now = time.time()
+
+    for book_id, state in store.items():
+        if state["is_finished"]:
+            continue
+
+        jobs = state["jobs"]
+        queue = state["queue"]
+
+        # Rescue expired leases
+        for jid, job in jobs.items():
+            if job["status"] == "PROCESSING" and now > job["lease_deadline"]:
+                job["attempt_count"] += 1
+                logger.warning(
+                    "%s lease expired for %s (held by %s, attempt %d/%d)",
+                    job["job_kind"].upper(),
+                    jid,
+                    job["assigned_to"],
+                    job["attempt_count"],
+                    MAX_ATTEMPTS,
+                )
+
+                if job["attempt_count"] >= MAX_ATTEMPTS:
+                    job["status"] = "FAILED"
+                    state["failed"] += 1
+                    logger.error(
+                        "%s job %s permanently failed after %d attempts",
+                        job["job_kind"].upper(),
+                        jid,
+                        MAX_ATTEMPTS,
+                    )
+                    _finish_check(store, book_id)
+                else:
+                    job["status"] = "PENDING"
+                    job["assigned_to"] = None
+                    job["assigned_at"] = 0
+                    job["lease_deadline"] = 0
+
+        for jid in queue:
+            job = jobs[jid]
+            if expected_kind and job["job_kind"] != expected_kind:
+                continue
+            if job["status"] != "PENDING":
+                continue
+
+            job["status"] = "PROCESSING"
+            job["assigned_to"] = worker_id
+            job["assigned_at"] = now
+            job["lease_deadline"] = now + LEASE_SECONDS
+
+            logger.info(
+                "%s job %s assigned to %s",
+                job["job_kind"].upper(),
+                jid,
+                worker_id,
+            )
+
+            response = {
+                "action": "PROCESS",
+                "job_id": jid,
+                "book_id": book_id,
+                "worker_id": worker_id,
+                "job_kind": job["job_kind"],
+                "attempt_count": job["attempt_count"],
+            }
+            if job["chunk_idx"] is not None:
+                response["chunk_idx"] = job["chunk_idx"]
+                response["start_offset"] = job["start_offset"]
+                response["page_count"] = job["page_count"]
+            response.update(extra_response or {})
+            return response
+
+    return _make_wait_or_shutdown()
+
+
+def _submit_result(
+    *,
+    store: Dict[str, dict],
+    payload: dict,
+    require_content: bool = False,
+    cleanup_fn=None,
+) -> dict:
+    jid = payload.get("job_id")
+    worker_id = payload.get("worker_id", "unknown")
+    success = bool(payload.get("success", False))
+    content = payload.get("content", "")
+
+    if not jid:
+        raise HTTPException(400, "job_id is required")
+
+    with job_lock:
+        for book_id, state in store.items():
+            if jid not in state["jobs"]:
+                continue
+
+            job = state["jobs"][jid]
+
+            if job["status"] == "COMPLETED":
+                return {"status": "ok", "note": "already completed, ignored"}
+
+            if success and (content or not require_content):
+                job["status"] = "COMPLETED"
+                job["result"] = content
+                state["completed"] += 1
+                logger.info(
+                    "%s job %s done by %s [%d/%d]",
+                    job["job_kind"].upper(),
+                    jid,
+                    worker_id,
+                    state["completed"],
+                    state["total"],
+                )
+            else:
+                job["attempt_count"] += 1
+                logger.warning(
+                    "%s job %s failed by %s (attempt %d/%d)",
+                    job["job_kind"].upper(),
+                    jid,
+                    worker_id,
+                    job["attempt_count"],
+                    MAX_ATTEMPTS,
+                )
+
+                if job["attempt_count"] >= MAX_ATTEMPTS:
+                    job["status"] = "FAILED"
+                    state["failed"] += 1
+                    logger.error(
+                        "%s job %s permanently failed after %d attempts",
+                        job["job_kind"].upper(),
+                        jid,
+                        MAX_ATTEMPTS,
+                    )
+                else:
+                    job["status"] = "PENDING"
+                    job["assigned_to"] = None
+                    job["assigned_at"] = 0
+                    job["lease_deadline"] = 0
+
+            _finish_check(store, book_id, cleanup_fn=cleanup_fn)
+            return {"status": "ok"}
+
+    raise HTTPException(404, f"Job {jid} not found")
+
+
+def _status_response(state: Optional[dict], *, book_id: str, failed_label: str) -> dict:
+    if not state:
+        return {"status": "not_found", "book_id": book_id}
+
+    failed_jobs = [
+        jid for jid in state["queue"]
+        if state["jobs"][jid]["status"] == "FAILED"
+    ]
+
+    overall = "running"
+    if state["is_finished"]:
+        overall = "failed" if state["failed"] > 0 else "completed"
+
+    return {
+        "book_id": book_id,
+        "status": overall,
+        "total": state["total"],
+        "completed": state["completed"],
+        "failed": state["failed"],
+        "is_finished": state["is_finished"],
+        "percent": int(state["completed"] / max(state["total"], 1) * 100),
+        failed_label: failed_jobs,
+    }
+
+
+def _cleanup_after_delay(meta: dict):
+    chunk_dir = meta.get("chunk_dir")
+    if not chunk_dir:
+        return
+    time.sleep(CLEANUP_DELAY_SEC)
+    shutil.rmtree(chunk_dir, ignore_errors=True)
+    logger.info("Cleaned temp dir: %s", chunk_dir)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# EXTRACTOR ROUTES
 # ─────────────────────────────────────────────────────────────────────────────
 @app.post("/start_extraction")
 @time_it
 def start_extraction(payload: dict):
-    """
-    Splits PDF into fixed-size chunk files on disk.
-    Creates one PENDING job per chunk.
-    Returns immediately — workers pull jobs asynchronously.
-    """
     book_id = payload.get("book_id")
     pdf_path = payload.get("pdf_path")
     base_dir = payload.get("base_dir", ".")
@@ -68,16 +348,8 @@ def start_extraction(payload: dict):
     if not Path(pdf_path).exists():
         raise HTTPException(404, f"PDF not found: {pdf_path}")
 
-    # FIX 2: Reject duplicate start if same book is already in-flight
-    with extraction_lock:
-        existing = extractions.get(book_id)
-        if existing and not existing["is_finished"]:
-            raise HTTPException(
-                409,
-                f"Book '{book_id}' is already being extracted "
-                f"({existing['completed']}/{existing['total']} chunks done). "
-                "Wait for it to finish or restart the server to clear state.",
-            )
+    with job_lock:
+        _reject_if_active(extractions, book_id, "Extraction")
 
     chunk_dir = Path(base_dir) / f"temp_extract_{book_id}"
     chunk_dir.mkdir(parents=True, exist_ok=True)
@@ -101,148 +373,54 @@ def start_extraction(payload: dict):
             writer.write(f)
 
         jid = str(uuid.uuid4())
-        jobs[jid] = {
-            "job_id": jid,
-            "book_id": book_id,
-            "chunk_idx": chunk_idx,
-            "chunk_path": str(chunk_path),
-            "start_offset": start,
-            "page_count": end - start,
-            "status": "PENDING",
-            "assigned_to": None,
-            "assigned_at": 0,
-            "lease_deadline": 0,
-            "attempt_count": 0,
-            "result": None,
-        }
+        jobs[jid] = _job_row(
+            job_id=jid,
+            book_id=book_id,
+            job_kind="extraction",
+            chunk_idx=chunk_idx,
+            start_offset=start,
+            page_count=end - start,
+            chunk_path=str(chunk_path),
+        )
         queue_order.append(jid)
 
-    total_chunks = len(queue_order)
-    logger.info("%d chunks queued for '%s'", total_chunks, book_id)
-
-    with extraction_lock:
-        extractions[book_id] = {
-            "jobs": jobs,
-            "queue": queue_order,
-            "total": total_chunks,
-            "total_pages": total_pages,
-            "completed": 0,
-            "failed": 0,
-            "is_finished": False,
+    state = _new_book_state(
+        total=len(queue_order),
+        meta={
+            "label": "EXTRACTION",
             "chunk_dir": str(chunk_dir),
-            "started_at": time.time(),
+            "total_pages": total_pages,
             "ocr_enabled": ocr_enabled,
-        }
+        },
+    )
+    state["jobs"] = jobs
+    state["queue"] = queue_order
+
+    with job_lock:
+        extractions[book_id] = state
+
+    logger.info("%d extraction chunks queued for '%s'", state["total"], book_id)
 
     return {
         "status": "started",
         "book_id": book_id,
-        "total_chunks": total_chunks,
+        "total_chunks": state["total"],
         "total_pages": total_pages,
         "ocr_enabled": ocr_enabled,
     }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# GET JOB — worker pulls when free
-# ─────────────────────────────────────────────────────────────────────────────
 @app.get("/get_job")
 @time_it
 def get_job(worker_id: str = "unknown"):
-    """
-    Workers call this when free. Returns job metadata.
-    Worker then calls GET /chunk/{job_id} to download PDF bytes.
-
-    Responses:
-      {"action": "PROCESS", "job_id": ..., ...}  — here is your next chunk
-      {"action": "WAIT"}                          — nothing now, poll again
-      {"action": "SHUTDOWN"}                      — all books finished
-    """
-    now = time.time()
-
-    with extraction_lock:
-        any_active = False
-
-        for book_id, state in extractions.items():
-            if state["is_finished"]:
-                continue
-            any_active = True
-            jobs = state["jobs"]
-            queue = state["queue"]
-
-            # ── Lease expiry rescue: expired PROCESSING → back to PENDING ─────
-            for jid, job in jobs.items():
-                if job["status"] == "PROCESSING" and now > job["lease_deadline"]:
-                    job["attempt_count"] += 1
-                    logger.warning(
-                        "Chunk %s lease expired (held by %s, attempt %s/%s)",
-                        job["chunk_idx"],
-                        job["assigned_to"],
-                        job["attempt_count"],
-                        MAX_ATTEMPTS,
-                    )
-
-                    if job["attempt_count"] >= MAX_ATTEMPTS:
-                        job["status"] = "FAILED"
-                        state["failed"] += 1
-                        logger.error(
-                            "Chunk %s permanently failed after %d attempts",
-                            job["chunk_idx"],
-                            MAX_ATTEMPTS,
-                        )
-                        _check_finished(book_id, state)
-                    else:
-                        job["status"] = "PENDING"
-                        job["assigned_to"] = None
-                        job["assigned_at"] = 0
-                        job["lease_deadline"] = 0
-
-            # ── Assign next PENDING chunk ─────────────────────────────────────
-            for jid in queue:
-                job = jobs[jid]
-                if job["status"] != "PENDING":
-                    continue
-
-                job["status"] = "PROCESSING"
-                job["assigned_to"] = worker_id
-                job["assigned_at"] = now
-                job["lease_deadline"] = now + LEASE_SECONDS
-
-                logger.info(
-                    "Chunk %s (pages %d-%d) assigned to %s",
-                    job["chunk_idx"],
-                    job["start_offset"] + 1,
-                    job["start_offset"] + job["page_count"],
-                    worker_id,
-                )
-
-                return {
-                    "action": "PROCESS",
-                    "job_id": jid,
-                    "book_id": book_id,
-                    "chunk_idx": job["chunk_idx"],
-                    "start_offset": job["start_offset"],
-                    "ocr_enabled": state.get("ocr_enabled", False),
-                }
-
-    # FIX 1: Return WAIT when no active books — workers keep polling for next upload
-    # SHUTDOWN is intentionally removed: auto-shutdown breaks multi-book ingestion.
-    # After book 1 finishes, workers must stay alive for book 2, 3, etc.
-    return {"action": "WAIT"}
+    with job_lock:
+        return _assign_pending_job(store=extractions, worker_id=worker_id, expected_kind="extraction")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# CHUNK BINARY — worker downloads raw PDF bytes
-# ─────────────────────────────────────────────────────────────────────────────
 @app.get("/chunk/{job_id}")
 @time_it
 def get_chunk_binary(job_id: str):
-    """
-    Returns raw PDF bytes for a chunk (application/octet-stream).
-    No base64 encoding — direct binary transfer.
-    Worker calls this after receiving a PROCESS response from /get_job.
-    """
-    with extraction_lock:
+    with job_lock:
         chunk_path = None
         for state in extractions.values():
             if job_id in state["jobs"]:
@@ -261,115 +439,29 @@ def get_chunk_binary(job_id: str):
     )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# SUBMIT RESULT — worker returns extracted markdown
-# ─────────────────────────────────────────────────────────────────────────────
 @app.post("/submit_result")
 @time_it
 def submit_result(payload: dict):
-    """
-    Worker posts result after processing a chunk.
-    Idempotent: duplicate submits for the same job_id are safely ignored.
-    No blacklist: failed workers can retry; dead workers simply stop polling.
-    """
-    jid = payload.get("job_id")
-    worker_id = payload.get("worker_id", "unknown")
-    success = payload.get("success", False)
-    content = payload.get("content", "")
-
-    with extraction_lock:
-        for book_id, state in extractions.items():
-            if jid not in state["jobs"]:
-                continue
-
-            job = state["jobs"][jid]
-
-            # Idempotent: already completed (late duplicate submit) → ignore
-            if job["status"] == "COMPLETED":
-                return {"status": "ok", "note": "already completed, ignored"}
-
-            if success and content:
-                job["status"] = "COMPLETED"
-                job["result"] = content
-                state["completed"] += 1
-                logger.info(
-                    "Chunk %s done by %s [%d/%d]",
-                    job["chunk_idx"],
-                    worker_id,
-                    state["completed"],
-                    state["total"],
-                )
-            else:
-                # Worker failed — return chunk to PENDING (no blacklist)
-                job["attempt_count"] += 1
-                logger.warning(
-                    "Chunk %s failed by %s (attempt %d/%d)",
-                    job["chunk_idx"],
-                    worker_id,
-                    job["attempt_count"],
-                    MAX_ATTEMPTS,
-                )
-
-                if job["attempt_count"] >= MAX_ATTEMPTS:
-                    job["status"] = "FAILED"
-                    state["failed"] += 1
-                    logger.error(
-                        "Chunk %s permanently failed after %d attempts",
-                        job["chunk_idx"],
-                        MAX_ATTEMPTS,
-                    )
-                else:
-                    job["status"] = "PENDING"
-                    job["assigned_to"] = None
-                    job["assigned_at"] = 0
-                    job["lease_deadline"] = 0
-
-            _check_finished(book_id, state)
-            return {"status": "ok"}
-
-    raise HTTPException(404, f"Job {jid} not found")
+    return _submit_result(
+        store=extractions,
+        payload=payload,
+        require_content=True,
+        cleanup_fn=_cleanup_after_delay,
+    )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# STATUS — polled by pipeline_controller
-# ─────────────────────────────────────────────────────────────────────────────
 @app.get("/extraction_status/{book_id}")
 @time_it
 def extraction_status(book_id: str):
-    with extraction_lock:
+    with job_lock:
         state = extractions.get(book_id)
-
-    if not state:
-        return {"status": "not_found", "book_id": book_id}
-
-    failed_chunks = [
-        state["jobs"][jid]["chunk_idx"]
-        for jid in state["queue"]
-        if state["jobs"][jid]["status"] == "FAILED"
-    ]
-    overall = "running"
-    if state["is_finished"]:
-        overall = "failed" if state["failed"] > 0 else "completed"
-
-    return {
-        "book_id": book_id,
-        "status": overall,
-        "total_chunks": state["total"],
-        "completed": state["completed"],
-        "failed": state["failed"],
-        "is_finished": state["is_finished"],
-        "percent": int(state["completed"] / max(state["total"], 1) * 100),
-        "failed_chunks": failed_chunks,
-    }
+    return _status_response(state, book_id=book_id, failed_label="failed_chunks")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# GET RESULT — pipeline_controller fetches assembled markdown
-# ─────────────────────────────────────────────────────────────────────────────
 @app.get("/get_result/{book_id}")
 @time_it
 def get_result(book_id: str):
-    with extraction_lock:
+    with job_lock:
         state = extractions.get(book_id)
 
     if not state:
@@ -385,15 +477,195 @@ def get_result(book_id: str):
     if failed:
         raise HTTPException(
             500,
-            f"Chunks {failed} permanently failed after {MAX_ATTEMPTS} attempts. "
-            "Check PDF integrity and Docling workers.",
+            f"Chunks {failed} permanently failed after {MAX_ATTEMPTS} attempts.",
         )
 
     full_text = f"# Text Extraction: {book_id}\n\n"
     for jid in state["queue"]:
-        full_text += state["jobs"][jid]["result"]
+        full_text += state["jobs"][jid]["result"] or ""
 
     return {"book_id": book_id, "content": full_text}
+
+
+@app.get("/download_ready/{book_id}")
+def download_ready(book_id: str):
+    with job_lock:
+        state = neo4j_jobs.get(book_id) or qdrant_jobs.get(book_id)
+    if not state:
+        raise HTTPException(404, f"No job for {book_id}")
+    path = state["meta"].get("ready_path")
+    if not path or not Path(path).exists():
+        raise HTTPException(404, f"ready_path missing for {book_id}")
+    return FileResponse(path=path, media_type="application/json", filename=f"{book_id}_ready.json")
+
+
+@app.get("/download_prop/{book_id}")
+def download_prop(book_id: str):
+    with job_lock:
+        state = qdrant_jobs.get(book_id)
+    if not state:
+        raise HTTPException(404, f"No qdrant job for {book_id}")
+    path = state["meta"].get("prop_path")
+    if not path or not Path(path).exists():
+        raise HTTPException(404, f"prop_path missing for {book_id}")
+    return FileResponse(path=path, media_type="application/json", filename=f"{book_id}_prop.json")
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NEO4J ROUTES
+# ─────────────────────────────────────────────────────────────────────────────
+@app.post("/start_neo4j")
+@time_it
+def start_neo4j(payload: dict):
+    book_id = payload.get("book_id")
+    ready_path = payload.get("ready_path")
+    base_dir = payload.get("base_dir", ".")
+
+    if not book_id or not ready_path:
+        raise HTTPException(400, "book_id and ready_path are required")
+    if not Path(ready_path).exists():
+        raise HTTPException(404, f"Ready path not found: {ready_path}")
+
+    with job_lock:
+        _reject_if_active(neo4j_jobs, book_id, "Neo4j ingestion")
+
+    state = _single_job_state(
+        book_id=book_id,
+        job_kind="neo4j",
+        meta={"ready_path": ready_path, "base_dir": base_dir},
+    )
+    with job_lock:
+        neo4j_jobs[book_id] = state
+
+    jid = state["queue"][0]
+    logger.info("Neo4j job queued for '%s' as %s", book_id, jid)
+
+    return {
+        "status": "started",
+        "book_id": book_id,
+        "job_id": jid,
+        "ready_path": ready_path,
+    }
+
+
+@app.get("/get_neo4j_job")
+@time_it
+def get_neo4j_job(worker_id: str = "unknown"):
+    with job_lock:
+        return _assign_pending_job(store=neo4j_jobs, worker_id=worker_id, expected_kind="neo4j")
+
+
+@app.post("/submit_neo4j_result")
+@time_it
+def submit_neo4j_result(payload: dict):
+    return _submit_result(store=neo4j_jobs, payload=payload, require_content=True)
+
+
+@app.get("/neo4j_status/{book_id}")
+@time_it
+def neo4j_status(book_id: str):
+    with job_lock:
+        state = neo4j_jobs.get(book_id)
+    return _status_response(state, book_id=book_id, failed_label="failed_jobs")
+
+
+@app.get("/get_neo4j_result/{book_id}")
+@time_it
+def get_neo4j_result(book_id: str):
+    with job_lock:
+        state = neo4j_jobs.get(book_id)
+    if not state:
+        raise HTTPException(404, f"No neo4j job for '{book_id}'")
+    if not state["is_finished"]:
+        raise HTTPException(400, "Neo4j job not finished yet")
+    if state["failed"] > 0:
+        raise HTTPException(500, "Neo4j job failed permanently")
+
+    jid = state["queue"][0]
+    return state["jobs"][jid]["result"]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# QDRANT ROUTES
+# ─────────────────────────────────────────────────────────────────────────────
+@app.post("/start_qdrant")
+@time_it
+def start_qdrant(payload: dict):
+    book_id = payload.get("book_id")
+    ready_path = payload.get("ready_path")
+    prop_path = payload.get("prop_path")
+    base_dir = payload.get("base_dir", ".")
+
+    if not book_id or not ready_path or not prop_path:
+        raise HTTPException(400, "book_id, ready_path and prop_path are required")
+    if not Path(ready_path).exists():
+        raise HTTPException(404, f"Ready path not found: {ready_path}")
+    if not Path(prop_path).exists():
+        raise HTTPException(404, f"Prop path not found: {prop_path}")
+
+    with job_lock:
+        _reject_if_active(qdrant_jobs, book_id, "Qdrant ingestion")
+
+    state = _single_job_state(
+        book_id=book_id,
+        job_kind="qdrant",
+        meta={
+            "ready_path": ready_path,
+            "prop_path": prop_path,
+            "base_dir": base_dir,
+        },
+    )
+    with job_lock:
+        qdrant_jobs[book_id] = state
+
+    jid = state["queue"][0]
+    logger.info("Qdrant job queued for '%s' as %s", book_id, jid)
+
+    return {
+        "status": "started",
+        "book_id": book_id,
+        "job_id": jid,
+        "ready_path": ready_path,
+        "prop_path": prop_path,
+    }
+
+
+@app.get("/get_qdrant_job")
+@time_it
+def get_qdrant_job(worker_id: str = "unknown"):
+    with job_lock:
+        return _assign_pending_job(store=qdrant_jobs, worker_id=worker_id, expected_kind="qdrant")
+
+
+@app.post("/submit_qdrant_result")
+@time_it
+def submit_qdrant_result(payload: dict):
+    return _submit_result(store=qdrant_jobs, payload=payload, require_content=True)
+
+
+@app.get("/qdrant_status/{book_id}")
+@time_it
+def qdrant_status(book_id: str):
+    with job_lock:
+        state = qdrant_jobs.get(book_id)
+    return _status_response(state, book_id=book_id, failed_label="failed_jobs")
+
+
+@app.get("/get_qdrant_result/{book_id}")
+@time_it
+def get_qdrant_result(book_id: str):
+    with job_lock:
+        state = qdrant_jobs.get(book_id)
+    if not state:
+        raise HTTPException(404, f"No qdrant job for '{book_id}'")
+    if not state["is_finished"]:
+        raise HTTPException(400, "Qdrant job not finished yet")
+    if state["failed"] > 0:
+        raise HTTPException(500, "Qdrant job failed permanently")
+
+    jid = state["queue"][0]
+    return state["jobs"][jid]["result"]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -402,42 +674,16 @@ def get_result(book_id: str):
 @app.get("/health")
 @time_it
 def health():
-    with extraction_lock:
+    with job_lock:
         active = {
-            bid: {"completed": s["completed"], "total": s["total"]}
-            for bid, s in extractions.items()
-            if not s["is_finished"]
+            "extraction": {bid: {"completed": s["completed"], "total": s["total"]} for bid, s in extractions.items() if not s["is_finished"]},
+            "neo4j": {bid: {"completed": s["completed"], "total": s["total"]} for bid, s in neo4j_jobs.items() if not s["is_finished"]},
+            "qdrant": {bid: {"completed": s["completed"], "total": s["total"]} for bid, s in qdrant_jobs.items() if not s["is_finished"]},
         }
-    return {"status": "ok", "active_books": active}
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# HELPERS
-# ─────────────────────────────────────────────────────────────────────────────
-@time_it
-def _check_finished(book_id: str, state: dict):
-    done = state["completed"] + state["failed"]
-    if done >= state["total"] and not state["is_finished"]:
-        state["is_finished"] = True
-        label = "FAILED" if state["failed"] > 0 else "COMPLETE"
-        logger.info(
-            "Extraction %s — '%s' (%d/%d chunks)",
-            label,
-            book_id,
-            state["completed"],
-            state["total"],
-        )
-        threading.Thread(
-            target=_cleanup_after_delay, args=(state["chunk_dir"],), daemon=True
-        ).start()
-
-
-@time_it
-def _cleanup_after_delay(chunk_dir: str):
-    time.sleep(CLEANUP_DELAY_SEC)
-    shutil.rmtree(chunk_dir, ignore_errors=True)
-    logger.info("Cleaned temp dir: %s", chunk_dir)
+    return {"status": "ok", "active": active}
 
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8004)
+
+

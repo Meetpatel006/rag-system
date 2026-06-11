@@ -102,37 +102,55 @@ def _run_qdrant_stage(job_id, book_id, ready_path, prop_path, jobs_col):
     Only called when qdrant_progress.status != "done".
     """
     try:
-        from processing.ingest_qdrant import run_qdrant_ingestion
+        import requests
+        import time
+        from pathlib import Path
+        import json
 
-        def qdrant_cb(percent, stage, message, extra=None):
-            jobs_col.update_one(
-                {"job_id": job_id},
-                {
-                    "$set": {
-                        "qdrant_progress": {
-                            "status": "running",
-                            "percent": (
-                                extra.get("chunks_done", 0)
-                                * 100
-                                // max(extra.get("total_chunks", 1), 1)
-                                if extra
-                                else 0
-                            ),
-                            "message": message,
-                            **(extra or {}),
-                        },
-                        "updated_at": _now_iso(),
-                    }
-                },
-            )
-
-        chunks_stored = run_qdrant_ingestion(
-            book_id=book_id,
-            ready_path=ready_path,
-            prop_path=prop_path,
-            base_dir=str(BASE_DIR),
-            progress_callback=qdrant_cb,
+        EXTRACTION_SERVER_URL = "http://localhost:8004"
+        
+        # 1. Start job
+        resp = requests.post(
+            f"{EXTRACTION_SERVER_URL}/start_qdrant",
+            json={
+                "book_id": book_id,
+                "ready_path": ready_path,
+                "prop_path": prop_path,
+                "base_dir": str(BASE_DIR)
+            },
+            timeout=60
         )
+        if resp.status_code != 200:
+            raise RuntimeError(f"Qdrant server rejected start: {resp.text}")
+
+        jobs_col.update_one(
+            {"job_id": job_id},
+            {"$set": {"qdrant_progress": {"status": "running", "percent": 10, "message": "Queued on worker..."}, "updated_at": _now_iso()}}
+        )
+
+        # 2. Poll status
+        while True:
+            time.sleep(5)
+            status_resp = requests.get(f"{EXTRACTION_SERVER_URL}/qdrant_status/{book_id}", timeout=15).json()
+            is_finished = status_resp.get("is_finished", False)
+            overall = status_resp.get("status", "running")
+
+            if is_finished:
+                if overall == "failed":
+                    raise RuntimeError("Qdrant worker failed.")
+                break
+
+        # 3. Get result
+        res = requests.get(f"{EXTRACTION_SERVER_URL}/get_qdrant_result/{book_id}", timeout=60).json()
+        chunks_stored = res.get("chunks_stored", 0)
+        chunks_json = res.get("chunks_json", [])
+
+        # 4. Write local _chunks.json for confidence report
+        out_dir = Path(BASE_DIR) / "data" / "qdrant"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / f"{book_id}_chunks.json"
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(chunks_json, f, indent=2, ensure_ascii=False)
 
         jobs_col.update_one(
             {"job_id": job_id},
@@ -172,31 +190,43 @@ def _run_neo4j_stage(job_id, book_id, ready_path, jobs_col):
             run_neo4j_ingestion requires it. The original signature omitted it.
     """
     try:
-        from processing.ingest_neo4j import run_neo4j_ingestion
+        import requests
+        import time
 
-        def neo4j_cb(percent, stage, message, extra=None):
-            # Internal percent range is 81-95; scale to 0-100 for display
-            display_pct = max(0, min(100, int((max(percent, 81) - 81) / 14 * 100)))
-            jobs_col.update_one(
-                {"job_id": job_id},
-                {
-                    "$set": {
-                        "neo4j_progress": {
-                            "status": "running",
-                            "percent": display_pct,
-                            "message": message,
-                        },
-                        "updated_at": _now_iso(),
-                    }
-                },
-            )
-
-        result = run_neo4j_ingestion(
-            book_id=book_id,
-            ready_path=ready_path,
-            base_dir=str(BASE_DIR),
-            progress_callback=neo4j_cb,
+        EXTRACTION_SERVER_URL = "http://localhost:8004"
+        
+        # 1. Start job
+        resp = requests.post(
+            f"{EXTRACTION_SERVER_URL}/start_neo4j",
+            json={
+                "book_id": book_id,
+                "ready_path": ready_path,
+                "base_dir": str(BASE_DIR)
+            },
+            timeout=60
         )
+        if resp.status_code != 200:
+            raise RuntimeError(f"Neo4j server rejected start: {resp.text}")
+
+        jobs_col.update_one(
+            {"job_id": job_id},
+            {"$set": {"neo4j_progress": {"status": "running", "percent": 10, "message": "Queued on worker..."}, "updated_at": _now_iso()}}
+        )
+
+        # 2. Poll status
+        while True:
+            time.sleep(5)
+            status_resp = requests.get(f"{EXTRACTION_SERVER_URL}/neo4j_status/{book_id}", timeout=15).json()
+            is_finished = status_resp.get("is_finished", False)
+            overall = status_resp.get("status", "running")
+
+            if is_finished:
+                if overall == "failed":
+                    raise RuntimeError("Neo4j worker failed.")
+                break
+
+        # 3. Get result
+        result = requests.get(f"{EXTRACTION_SERVER_URL}/get_neo4j_result/{book_id}", timeout=60).json()
 
         # Build graph_report that matches confidence_report + frontend expectations
         graph_report = {

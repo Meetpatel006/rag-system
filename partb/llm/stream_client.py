@@ -71,6 +71,7 @@ async def _stream_litellm(
     }
 
     t0 = time.perf_counter()
+    t_first_token = None
     token_count = 0
     char_count = 0
     logger.info("[LiteLLM] Request | url=%s | model=%s | mode=%s", url, body["model"], mode)
@@ -92,7 +93,10 @@ async def _stream_litellm(
                         continue
                     data = line[5:].lstrip()
                     if data == "[DONE]":
-                        logger.info("[LiteLLM] Stream done marker received | tokens=%s | chars=%s | elapsed=%.2fs", token_count, char_count, time.perf_counter() - t0)
+                        if t_first_token:
+                            logger.info("[LiteLLM] Stream done marker received | tokens=%s | chars=%s | cold_startup_time=%.2fs | response_time=%.2fs", token_count, char_count, t_first_token - t0, time.perf_counter() - t_first_token)
+                        else:
+                            logger.info("[LiteLLM] Stream done marker received | tokens=%s | chars=%s | elapsed=%.2fs", token_count, char_count, time.perf_counter() - t0)
                         break
                     try:
                         chunk = json.loads(data)
@@ -107,9 +111,15 @@ async def _stream_litellm(
                         token_count += 1
                         char_count += len(content)
                         if token_count == 1:
-                            logger.info("[LiteLLM] First token received | elapsed=%.2fs", time.perf_counter() - t0)
+                            t_first_token = time.perf_counter()
+                            logger.info("[LiteLLM] First token received | cold_startup_time=%.2fs", t_first_token - t0)
                         yield {"type": "token", "content": content}
-                logger.info("[LiteLLM] Stream complete | model=%s | tokens=%s | chars=%s | elapsed=%.2fs", body["model"], token_count, char_count, time.perf_counter() - t0)
+                
+                t_end = time.perf_counter()
+                if t_first_token:
+                    logger.info("[LiteLLM] Stream complete | model=%s | tokens=%s | chars=%s | cold_startup_time=%.2fs | response_time=%.2fs", body["model"], token_count, char_count, t_first_token - t0, t_end - t_first_token)
+                else:
+                    logger.info("[LiteLLM] Stream complete | model=%s | tokens=%s | chars=%s | elapsed=%.2fs", body["model"], token_count, char_count, t_end - t0)
         except httpx.TimeoutException:
             logger.error("[LiteLLM] Timeout | timeout=%s | elapsed=%.2fs", timeout, time.perf_counter() - t0)
             yield {"type": "error", "message": f"LLM timeout after {timeout}s"}
@@ -130,6 +140,7 @@ async def _stream_ollama(
     body = {"model": model, "prompt": prompt, "stream": True}
 
     t0 = time.perf_counter()
+    t_first_token = None
     token_count = 0
     char_count = 0
     logger.info("[Ollama] Request | url=%s | model=%s | mode=%s", url, model, mode)
@@ -154,9 +165,15 @@ async def _stream_ollama(
                         token_count += 1
                         char_count += len(token)
                         if token_count == 1:
-                            logger.info("[Ollama] First token received | elapsed=%.2fs", time.perf_counter() - t0)
+                            t_first_token = time.perf_counter()
+                            logger.info("[Ollama] First token received | cold_startup_time=%.2fs", t_first_token - t0)
                         yield {"type": "token", "content": token}
-                logger.info("[Ollama] Stream complete | model=%s | tokens=%s | chars=%s | elapsed=%.2fs", model, token_count, char_count, time.perf_counter() - t0)
+                
+                t_end = time.perf_counter()
+                if t_first_token:
+                    logger.info("[Ollama] Stream complete | model=%s | tokens=%s | chars=%s | cold_startup_time=%.2fs | response_time=%.2fs", model, token_count, char_count, t_first_token - t0, t_end - t_first_token)
+                else:
+                    logger.info("[Ollama] Stream complete | model=%s | tokens=%s | chars=%s | elapsed=%.2fs", model, token_count, char_count, t_end - t0)
         except httpx.TimeoutException:
             logger.error("[Ollama] Timeout | timeout=%s | elapsed=%.2fs", timeout, time.perf_counter() - t0)
             yield {"type": "error", "message": f"Ollama timeout after {timeout}s"}
