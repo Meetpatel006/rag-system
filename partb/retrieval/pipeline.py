@@ -353,22 +353,34 @@ def extract_query_entities(query: str) -> list[str]:
 def neo4j_sections_for_entities(
     book_ids: list[str], entity_terms: list[str]
 ) -> list[str]:
-    if not entity_terms or not book_ids:
+    if not entity_terms:
         return []
-    cypher = """
-    MATCH (e:Entity)-[:MENTIONED_IN]->(s)
-    WHERE s.book_id IN $book_ids AND (s:Section OR s:Subsection)
-      AND ANY(t IN $terms WHERE
-          toLower(e.name) = toLower(t)
-          OR (size(t) >= 4 AND toLower(e.name) CONTAINS toLower(t))
-          OR (size(t) >= 4 AND toLower(t) CONTAINS toLower(e.name)))
-    RETURN DISTINCT s.name AS section_name LIMIT $lim
-    """
+    if book_ids:
+        cypher = """
+        MATCH (e:Entity)-[:MENTIONED_IN]->(s)
+        WHERE s.book_id IN $book_ids AND (s:Section OR s:Subsection)
+          AND ANY(t IN $terms WHERE
+              toLower(e.name) = toLower(t)
+              OR (size(t) >= 4 AND toLower(e.name) CONTAINS toLower(t))
+              OR (size(t) >= 4 AND toLower(t) CONTAINS toLower(e.name)))
+        RETURN DISTINCT s.name AS section_name LIMIT $lim
+        """
+        params = {"book_ids": book_ids, "terms": entity_terms, "lim": NEO4J_ENTITY_LIMIT}
+    else:
+        # No book filter — query across all books
+        cypher = """
+        MATCH (e:Entity)-[:MENTIONED_IN]->(s)
+        WHERE (s:Section OR s:Subsection)
+          AND ANY(t IN $terms WHERE
+              toLower(e.name) = toLower(t)
+              OR (size(t) >= 4 AND toLower(e.name) CONTAINS toLower(t))
+              OR (size(t) >= 4 AND toLower(t) CONTAINS toLower(e.name)))
+        RETURN DISTINCT s.name AS section_name LIMIT $lim
+        """
+        params = {"terms": entity_terms, "lim": NEO4J_ENTITY_LIMIT}
     try:
         with get_neo4j().session() as session:
-            rows = session.run(
-                cypher, book_ids=book_ids, terms=entity_terms, lim=NEO4J_ENTITY_LIMIT
-            )
+            rows = session.run(cypher, **params)
             return [
                 r["section_name"]
                 for r in rows
@@ -381,19 +393,30 @@ def neo4j_sections_for_entities(
 
 @log_process
 def neo4j_specs_for_terms(book_ids: list[str], entity_terms: list[str]) -> list[dict]:
-    if not entity_terms or not book_ids:
+    if not entity_terms:
         return []
-    cypher = """
-    MATCH (e:Entity)-[:HAS_SPECIFICATION]->(sp:Spec)
-    WHERE e.book_id IN $book_ids
-      AND ANY(t IN $terms WHERE toLower(e.name) CONTAINS toLower(t)
-              OR toLower(t) CONTAINS toLower(e.name))
-    RETURN e.name AS entity, sp.value AS value, sp.unit AS unit,
-           sp.raw AS raw, sp.section AS section LIMIT 50
-    """
+    if book_ids:
+        cypher = """
+        MATCH (e:Entity)-[:HAS_SPECIFICATION]->(sp:Spec)
+        WHERE e.book_id IN $book_ids
+          AND ANY(t IN $terms WHERE toLower(e.name) CONTAINS toLower(t)
+                  OR toLower(t) CONTAINS toLower(e.name))
+        RETURN e.name AS entity, sp.value AS value, sp.unit AS unit,
+               sp.raw AS raw, sp.section AS section LIMIT 50
+        """
+        params = {"book_ids": book_ids, "terms": entity_terms}
+    else:
+        cypher = """
+        MATCH (e:Entity)-[:HAS_SPECIFICATION]->(sp:Spec)
+        WHERE ANY(t IN $terms WHERE toLower(e.name) CONTAINS toLower(t)
+                  OR toLower(t) CONTAINS toLower(e.name))
+        RETURN e.name AS entity, sp.value AS value, sp.unit AS unit,
+               sp.raw AS raw, sp.section AS section LIMIT 50
+        """
+        params = {"terms": entity_terms}
     try:
         with get_neo4j().session() as session:
-            rows = session.run(cypher, book_ids=book_ids, terms=entity_terms)
+            rows = session.run(cypher, **params)
             return [
                 {
                     "entity": r["entity"] or "",
@@ -410,6 +433,7 @@ def neo4j_specs_for_terms(book_ids: list[str], entity_terms: list[str]) -> list[
         return []
 
 
+
 @time_it
 def _parse_payload(pl: dict, pid: str) -> dict:
     """Parses a Qdrant section payload into a standard dict."""
@@ -422,7 +446,7 @@ def _parse_payload(pl: dict, pid: str) -> dict:
         else [0, 0]
     )
     return {
-        "chunk_id": pid,
+        "chunk_id": pl.get("chunk_id") or pid,
         "text": pl.get("text") or "",
         "book_id": pl.get("book_id"),
         "section_path": pl.get("section_path") or [],
@@ -443,12 +467,22 @@ def fetch_sections_by_chunk_ids(
     if not chunk_ids:
         return []
     client = get_qdrant()
+    from qdrant_client import models as qm
     results = []
     for i in range(0, len(chunk_ids), 64):
         try:
-            pts = client.retrieve(
+            batch_ids = chunk_ids[i : i + 64]
+            pts, _ = client.scroll(
                 collection_name=COLLECTION_SECTIONS,
-                ids=chunk_ids[i : i + 64],
+                scroll_filter=qm.Filter(
+                    must=[
+                        qm.FieldCondition(
+                            key="chunk_id",
+                            match=qm.MatchAny(any=batch_ids)
+                        )
+                    ]
+                ),
+                limit=len(batch_ids),
                 with_payload=True,
             )
             for p in pts:
