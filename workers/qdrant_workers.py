@@ -3,19 +3,28 @@ import tempfile
 import time
 import traceback
 import uuid
+import sys
 from pathlib import Path
 
-import requests
-from processing.ingest_qdrant import run_qdrant_ingestion
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from parta.logger import logger
 
-SERVER_URL = os.environ.get("SERVER_URL", "http://192.168.X.X:8004")
+import requests
+from parta.processing.ingest_qdrant import run_qdrant_batch
+
+SERVER_URL = os.environ.get("SERVER_URL", "http://127.0.0.1:8004")
 WORKER_ID = f"qdrant-{uuid.uuid4().hex[:6]}"
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 # ── persistent session — reuses TCP connection across all poll cycles ─────────
 _session = requests.Session()
 
-print(f"[{WORKER_ID}] Qdrant worker started. SERVER={SERVER_URL}")
+logger.info("=" * 80)
+logger.info(f"[{WORKER_ID}] QDRANT WORKER STARTED (batch mode)")
+logger.info(f"[{WORKER_ID}] SERVER   : {SERVER_URL}")
+logger.info(f"[{WORKER_ID}] BASE_DIR : {BASE_DIR}")
+logger.info("=" * 80)
+is_connected = False
 
 while True:
     job_id = None
@@ -29,8 +38,12 @@ while True:
             timeout=30,
         )
 
+        if not is_connected:
+            logger.info(f"[{WORKER_ID}] Connected to server")
+            is_connected = True
+
         if r.status_code != 200:
-            print(f"[{WORKER_ID}] Failed to get job ({r.status_code})")
+            logger.error(f"[{WORKER_ID}] Failed to get job ({r.status_code})")
             time.sleep(5)
             continue
 
@@ -40,14 +53,25 @@ while True:
             time.sleep(2)
             continue
 
-        job_id = job["job_id"]
-        book_id = job["book_id"]
+        job_id       = job["job_id"]
+        book_id      = job["book_id"]
+        batch_start  = job.get("start_offset", 0)
+        batch_count  = job.get("page_count", 0)
+        batch_idx    = job.get("chunk_idx", 0)
+        # batch_kind is encoded in chunk_path field by the server
+        batch_kind   = job.get("chunk_path", "propositions")
         # ready_path and prop_path from job response are server-side paths — do not use directly
 
-        print(f"[{WORKER_ID}] Processing book={book_id} job={job_id}")
+        logger.info("\n" + "=" * 80)
+        logger.info(f"[{WORKER_ID}] NEW QDRANT BATCH JOB")
+        logger.info(f"[{WORKER_ID}] JOB ID     : {job_id}")
+        logger.info(f"[{WORKER_ID}] BOOK ID    : {book_id}")
+        logger.info(f"[{WORKER_ID}] KIND       : {batch_kind}")
+        logger.info(f"[{WORKER_ID}] BATCH      : #{batch_idx} ({batch_kind} {batch_start}–{batch_start + batch_count - 1})")
+        logger.info("=" * 80)
 
         # ── download ready.json from server ───────────────────────────────────
-        print(f"[{WORKER_ID}] Downloading ready file for '{book_id}'...")
+        logger.info(f"[{WORKER_ID}] Downloading ready file for '{book_id}'...")
         r2 = _session.get(
             f"{SERVER_URL}/download_ready/{book_id}",
             timeout=60,
@@ -64,7 +88,7 @@ while True:
             local_ready_path = f.name
 
         # ── download prop.json from server ────────────────────────────────────
-        print(f"[{WORKER_ID}] Downloading prop file for '{book_id}'...")
+        logger.info(f"[{WORKER_ID}] Downloading prop file for '{book_id}'...")
         r3 = _session.get(
             f"{SERVER_URL}/download_prop/{book_id}",
             timeout=60,
@@ -80,21 +104,23 @@ while True:
             f.write(r3.content)
             local_prop_path = f.name
 
-        print(f"[{WORKER_ID}] Files ready — running ingestion...")
+        logger.info(f"[{WORKER_ID}] Files ready — running batch ingestion ({batch_kind} {batch_start}–{batch_start + batch_count - 1})...")
 
-        # ── run ingestion ──────────────────────────────────────────────────────
-        chunks_stored = run_qdrant_ingestion(
+        # ── run batch ingestion ────────────────────────────────────────────────
+        start_time = time.time()
+
+        chunks_stored = run_qdrant_batch(
             book_id=book_id,
             ready_path=local_ready_path,
             prop_path=local_prop_path,
             base_dir=str(BASE_DIR),
-            progress_callback=None,
+            batch_start=batch_start,
+            batch_count=batch_count,
+            batch_kind=batch_kind,
         )
 
-        import json
-        chunk_file = Path(BASE_DIR) / "data" / "qdrant" / f"{book_id}_chunks.json"
-        with open(chunk_file, "r", encoding="utf-8") as f:
-            chunks_json_data = json.load(f)
+        elapsed = round(time.time() - start_time, 2)
+        logger.info(f"[{WORKER_ID}] Qdrant batch completed in {elapsed}s — stored={chunks_stored}")
 
         # ── submit success ─────────────────────────────────────────────────────
         response = _session.post(
@@ -105,17 +131,25 @@ while True:
                 "success": True,
                 "content": {
                     "chunks_stored": chunks_stored,
-                    "chunks_json": chunks_json_data
+                    "batch_kind": batch_kind,
+                    "batch_start": batch_start,
+                    "batch_count": batch_count,
                 }
             },
             timeout=30,
         )
 
-        print(f"[{WORKER_ID}] Completed job={job_id} status={response.status_code}")
+        logger.info(f"[{WORKER_ID}] Completed batch #{batch_idx} ({batch_kind}) status={response.status_code}")
+
+    except requests.exceptions.ConnectionError:
+        if is_connected:
+            logger.error(f"[{WORKER_ID}] Disconnected from server. Waiting to reconnect...")
+            is_connected = False
+        time.sleep(5)
 
     except Exception as e:
-        print(f"[{WORKER_ID}] Error: {e}")
-        traceback.print_exc()
+        logger.error(f"[{WORKER_ID}] Error: {e}")
+        logger.error(traceback.format_exc())
 
         if job_id:
             try:

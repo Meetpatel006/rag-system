@@ -3,24 +3,29 @@ import time
 import uuid
 import tempfile
 import traceback
+import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from parta.logger import logger
 
 import requests
 
-from processing.ingest_neo4j import run_neo4j_ingestion
+from parta.processing.ingest_neo4j import run_neo4j_batch
 
-SERVER_URL = os.environ.get("SERVER_URL", "http://192.168.X.X:8004")
+SERVER_URL = os.environ.get("SERVER_URL", "http://127.0.0.1:8004")
 WORKER_ID  = f"neo4j-{uuid.uuid4().hex[:6]}"
 BASE_DIR   = Path(__file__).resolve().parent.parent
 
 # ── persistent session — reuses TCP connection across all poll cycles ─────────
 _session = requests.Session()
 
-print("=" * 80)
-print(f"[{WORKER_ID}] NEO4J WORKER STARTED")
-print(f"[{WORKER_ID}] SERVER   : {SERVER_URL}")
-print(f"[{WORKER_ID}] BASE_DIR : {BASE_DIR}")
-print("=" * 80)
+logger.info("=" * 80)
+logger.info(f"[{WORKER_ID}] NEO4J WORKER STARTED (batch mode)")
+logger.info(f"[{WORKER_ID}] SERVER   : {SERVER_URL}")
+logger.info(f"[{WORKER_ID}] BASE_DIR : {BASE_DIR}")
+logger.info("=" * 80)
+is_connected = False
 
 while True:
     job_id  = None
@@ -34,8 +39,12 @@ while True:
             timeout=30,
         )
 
+        if not is_connected:
+            logger.info(f"[{WORKER_ID}] Connected to server")
+            is_connected = True
+
         if r.status_code != 200:
-            print(f"[{WORKER_ID}] get_neo4j_job failed: HTTP {r.status_code}")
+            logger.error(f"[{WORKER_ID}] get_neo4j_job failed: HTTP {r.status_code}")
             time.sleep(5)
             continue
 
@@ -44,18 +53,21 @@ while True:
             time.sleep(2)
             continue
 
-        job_id  = job.get("job_id")
-        book_id = job.get("book_id")
-        # ready_path from job response is a server-side path — do not use it directly
+        job_id       = job.get("job_id")
+        book_id      = job.get("book_id")
+        batch_start  = job.get("start_offset", 0)
+        batch_count  = job.get("page_count", 0)
+        batch_idx    = job.get("chunk_idx", 0)
 
-        print("\n" + "=" * 80)
-        print(f"[{WORKER_ID}] NEW NEO4J JOB")
-        print(f"[{WORKER_ID}] JOB ID     : {job_id}")
-        print(f"[{WORKER_ID}] BOOK ID    : {book_id}")
-        print("=" * 80)
+        logger.info("\n" + "=" * 80)
+        logger.info(f"[{WORKER_ID}] NEW NEO4J BATCH JOB")
+        logger.info(f"[{WORKER_ID}] JOB ID     : {job_id}")
+        logger.info(f"[{WORKER_ID}] BOOK ID    : {book_id}")
+        logger.info(f"[{WORKER_ID}] BATCH      : #{batch_idx} (chunks {batch_start}–{batch_start + batch_count - 1})")
+        logger.info("=" * 80)
 
         # ── download ready.json from server ───────────────────────────────────
-        print(f"[{WORKER_ID}] Downloading ready file for '{book_id}'...")
+        logger.info(f"[{WORKER_ID}] Downloading ready file for '{book_id}'...")
         r2 = _session.get(
             f"{SERVER_URL}/download_ready/{book_id}",
             timeout=60,
@@ -71,21 +83,22 @@ while True:
             f.write(r2.content)
             local_ready_path = f.name
 
-        print(f"[{WORKER_ID}] Ready file saved to {local_ready_path}")
+        logger.info(f"[{WORKER_ID}] Ready file saved to {local_ready_path}")
 
-        # ── run ingestion ──────────────────────────────────────────────────────
-        print(f"[{WORKER_ID}] Starting Neo4j ingestion...")
+        # ── run batch ingestion ────────────────────────────────────────────────
+        logger.info(f"[{WORKER_ID}] Starting Neo4j batch ingestion (chunks {batch_start}–{batch_start + batch_count - 1})...")
         start_time = time.time()
 
-        result = run_neo4j_ingestion(
+        result = run_neo4j_batch(
             book_id=book_id,
             ready_path=local_ready_path,
             base_dir=str(BASE_DIR),
-            progress_callback=None,
+            batch_start=batch_start,
+            batch_count=batch_count,
         )
 
         elapsed = round(time.time() - start_time, 2)
-        print(f"[{WORKER_ID}] Neo4j ingestion completed in {elapsed}s")
+        logger.info(f"[{WORKER_ID}] Neo4j batch completed in {elapsed}s — entities={result.get('entities_written', 0)}, specs={result.get('specs_written', 0)}")
 
         # ── submit success ─────────────────────────────────────────────────────
         response = _session.post(
@@ -100,15 +113,21 @@ while True:
         )
 
         if response.status_code == 200:
-            print(f"[{WORKER_ID}] Completion acknowledged for book '{book_id}'")
+            logger.info(f"[{WORKER_ID}] Completion acknowledged for batch #{batch_idx} of '{book_id}'")
         else:
-            print(f"[{WORKER_ID}] submit_neo4j_result failed: HTTP {response.status_code}")
+            logger.error(f"[{WORKER_ID}] submit_neo4j_result failed: HTTP {response.status_code}")
 
-        print("=" * 80)
+        logger.info("=" * 80)
 
-    except Exception:
-        print(f"[{WORKER_ID}] Neo4j worker error")
-        traceback.print_exc()
+    except requests.exceptions.ConnectionError:
+        if is_connected:
+            logger.error(f"[{WORKER_ID}] Disconnected from server. Waiting to reconnect...")
+            is_connected = False
+        time.sleep(5)
+
+    except Exception as e:
+        logger.error(f"[{WORKER_ID}] Neo4j worker error: {e}")
+        logger.error(traceback.format_exc())
 
         if job_id:
             try:
@@ -122,8 +141,9 @@ while True:
                     },
                     timeout=30,
                 )
-            except Exception:
-                traceback.print_exc()
+            except Exception as e:
+                logger.error(f"[{WORKER_ID}] Error submitting failure: {e}")
+                logger.error(traceback.format_exc())
 
         time.sleep(5)
 

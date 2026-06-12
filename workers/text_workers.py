@@ -14,7 +14,7 @@ This version is layout-aware:
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import time
 import uuid
@@ -28,9 +28,11 @@ try:
 except ImportError:
     import fitz
 
-from parta.logger import time_it
+from parta.logger import time_it, logger
 
-SERVER_URL = "http://localhost:8004"
+import os
+
+SERVER_URL = os.environ.get("SERVER_URL", "http://127.0.0.1:8004")
 WORKER_ID = f"worker-{uuid.uuid4().hex[:6]}"
 
 REQUEST_TIMEOUT = 30
@@ -220,16 +222,28 @@ def process_chunk(pdf_bytes: bytes, start_offset: int) -> str:
         raise RuntimeError(f"PDF extraction failed: {exc}") from exc
 
 
+_session = requests.Session()
+is_connected = False
+
 def start_worker():
-    print(f"[{WORKER_ID}] Starting layout-aware extraction worker...")
+    global is_connected
+    logger.info("=" * 80)
+    logger.info(f"[{WORKER_ID}] TEXT WORKER STARTED (extraction mode)")
+    logger.info(f"[{WORKER_ID}] SERVER   : {SERVER_URL}")
+    logger.info(f"[{WORKER_ID}] BASE_DIR : {Path(__file__).resolve().parent.parent}")
+    logger.info("=" * 80)
 
     while True:
         try:
-            resp = requests.get(
+            resp = _session.get(
                 f"{SERVER_URL}/get_job",
                 params={"worker_id": WORKER_ID},
                 timeout=REQUEST_TIMEOUT,
             )
+
+            if not is_connected:
+                logger.info(f"[{WORKER_ID}] Connected to server")
+                is_connected = True
 
             if resp.status_code != 200:
                 time.sleep(ERROR_SLEEP)
@@ -248,11 +262,11 @@ def start_worker():
                 chunk_idx = data["chunk_idx"]
                 start_offset = data.get("start_offset", 0)
 
-                print(
+                logger.info(
                     f"[{WORKER_ID}] Got chunk {chunk_idx} for book {book_id}. Downloading..."
                 )
 
-                chunk_resp = requests.get(
+                chunk_resp = _session.get(
                     f"{SERVER_URL}/chunk/{job_id}",
                     stream=True,
                     timeout=REQUEST_TIMEOUT,
@@ -261,11 +275,11 @@ def start_worker():
                 if chunk_resp.status_code == 200:
                     try:
                         content = process_chunk(chunk_resp.content, start_offset)
-                        print(
+                        logger.info(
                             f"[{WORKER_ID}] Extraction success for chunk {chunk_idx}. Submitting."
                         )
 
-                        requests.post(
+                        _session.post(
                             f"{SERVER_URL}/submit_result",
                             json={
                                 "job_id": job_id,
@@ -277,10 +291,10 @@ def start_worker():
                         )
 
                     except Exception as e:
-                        print(
+                        logger.error(
                             f"[{WORKER_ID}] Extraction failed for chunk {chunk_idx}: {e}"
                         )
-                        requests.post(
+                        _session.post(
                             f"{SERVER_URL}/submit_result",
                             json={
                                 "job_id": job_id,
@@ -291,14 +305,16 @@ def start_worker():
                             timeout=REQUEST_TIMEOUT,
                         )
                 else:
-                    print(f"[{WORKER_ID}] Failed to download chunk {job_id}")
+                    logger.error(f"[{WORKER_ID}] Failed to download chunk {job_id}")
 
         except requests.exceptions.ConnectionError:
-            print(f"[{WORKER_ID}] Cannot reach server at {SERVER_URL}. Waiting...")
+            if is_connected:
+                logger.error(f"[{WORKER_ID}] Disconnected from server. Waiting to reconnect...")
+                is_connected = False
             time.sleep(ERROR_SLEEP)
 
         except Exception as e:
-            print(f"[{WORKER_ID}] Error: {e}")
+            logger.error(f"[{WORKER_ID}] Error: {e}")
             time.sleep(ERROR_SLEEP)
 
 

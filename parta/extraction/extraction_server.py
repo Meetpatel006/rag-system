@@ -27,12 +27,18 @@ from typing import Dict, Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
+import json
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from pypdf import PdfReader, PdfWriter
 
 from parta.logger import async_time_it, logger, time_it
+
+# ── Batch sizes for distributed workers ───────────────────────────────────────
+# Each connected worker gets one batch. More workers = more parallelism.
+NEO4J_BATCH_SIZE  = 30   # chunks per neo4j worker batch
+QDRANT_BATCH_SIZE = 200  # items per qdrant worker batch
 
 app = FastAPI(title="Unified Job Server")
 
@@ -223,6 +229,8 @@ def _assign_pending_job(
                 response["chunk_idx"] = job["chunk_idx"]
                 response["start_offset"] = job["start_offset"]
                 response["page_count"] = job["page_count"]
+            if job.get("chunk_path"):
+                response["chunk_path"] = job["chunk_path"]
             response.update(extra_response or {})
             return response
 
@@ -530,21 +538,45 @@ def start_neo4j(payload: dict):
     with job_lock:
         _reject_if_active(neo4j_jobs, book_id, "Neo4j ingestion")
 
-    state = _single_job_state(
-        book_id=book_id,
-        job_kind="neo4j",
-        meta={"ready_path": ready_path, "base_dir": base_dir},
+    # ── Read chunk count and split into batches for parallel workers ───────
+    with open(ready_path, "r", encoding="utf-8") as f:
+        total_chunks = len(json.load(f))
+
+    batch_size = NEO4J_BATCH_SIZE
+    jobs = {}
+    queue_order = []
+
+    for batch_idx, start in enumerate(range(0, total_chunks, batch_size)):
+        end = min(start + batch_size, total_chunks)
+        jid = str(uuid.uuid4())
+        jobs[jid] = _job_row(
+            job_id=jid, book_id=book_id, job_kind="neo4j",
+            chunk_idx=batch_idx, start_offset=start, page_count=end - start,
+        )
+        queue_order.append(jid)
+
+    state = _new_book_state(
+        total=len(queue_order),
+        meta={"label": "NEO4J", "ready_path": ready_path, "base_dir": base_dir,
+              "total_chunks": total_chunks},
     )
+    state["jobs"] = jobs
+    state["queue"] = queue_order
+
     with job_lock:
         neo4j_jobs[book_id] = state
 
-    jid = state["queue"][0]
-    logger.info("Neo4j job queued for '%s' as %s", book_id, jid)
+    logger.info(
+        "Neo4j split into %d batches (%d chunks) for '%s'",
+        len(queue_order), total_chunks, book_id,
+    )
 
     return {
         "status": "started",
         "book_id": book_id,
-        "job_id": jid,
+        "total_batches": len(queue_order),
+        "total_chunks": total_chunks,
+        "batch_size": batch_size,
         "ready_path": ready_path,
     }
 
@@ -582,8 +614,18 @@ def get_neo4j_result(book_id: str):
     if state["failed"] > 0:
         raise HTTPException(500, "Neo4j job failed permanently")
 
-    jid = state["queue"][0]
-    return state["jobs"][jid]["result"]
+    # ── Aggregate results from all batch workers ──────────────────────────
+    totals = {
+        "sections_written": 0, "entities_written": 0,
+        "specs_written": 0, "tables_written": 0,
+        "cooccurrence_edges": 0, "elapsed_seconds": 0,
+    }
+    for jid in state["queue"]:
+        r = state["jobs"][jid].get("result")
+        if r and isinstance(r, dict):
+            for k in totals:
+                totals[k] += r.get(k, 0)
+    return totals
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -607,25 +649,67 @@ def start_qdrant(payload: dict):
     with job_lock:
         _reject_if_active(qdrant_jobs, book_id, "Qdrant ingestion")
 
-    state = _single_job_state(
-        book_id=book_id,
-        job_kind="qdrant",
+    # ── Read item counts and split into batches ───────────────────────────
+    with open(prop_path, "r", encoding="utf-8") as f:
+        total_props = len(json.load(f))
+    with open(ready_path, "r", encoding="utf-8") as f:
+        total_sections = len(json.load(f))
+
+    batch_size = QDRANT_BATCH_SIZE
+    jobs = {}
+    queue_order = []
+
+    # Proposition batches
+    for batch_idx, start in enumerate(range(0, total_props, batch_size)):
+        end = min(start + batch_size, total_props)
+        jid = str(uuid.uuid4())
+        jobs[jid] = _job_row(
+            job_id=jid, book_id=book_id, job_kind="qdrant",
+            chunk_idx=batch_idx, start_offset=start, page_count=end - start,
+            # Encode batch_kind in chunk_path field (reuse existing field)
+            chunk_path="propositions",
+        )
+        queue_order.append(jid)
+
+    # Section batches
+    sec_batch_offset = len(queue_order)
+    for batch_idx, start in enumerate(range(0, total_sections, batch_size)):
+        end = min(start + batch_size, total_sections)
+        jid = str(uuid.uuid4())
+        jobs[jid] = _job_row(
+            job_id=jid, book_id=book_id, job_kind="qdrant",
+            chunk_idx=sec_batch_offset + batch_idx,
+            start_offset=start, page_count=end - start,
+            chunk_path="sections",
+        )
+        queue_order.append(jid)
+
+    state = _new_book_state(
+        total=len(queue_order),
         meta={
-            "ready_path": ready_path,
-            "prop_path": prop_path,
-            "base_dir": base_dir,
+            "label": "QDRANT", "ready_path": ready_path,
+            "prop_path": prop_path, "base_dir": base_dir,
+            "total_props": total_props, "total_sections": total_sections,
         },
     )
+    state["jobs"] = jobs
+    state["queue"] = queue_order
+
     with job_lock:
         qdrant_jobs[book_id] = state
 
-    jid = state["queue"][0]
-    logger.info("Qdrant job queued for '%s' as %s", book_id, jid)
+    logger.info(
+        "Qdrant split into %d batches (%d props + %d sections) for '%s'",
+        len(queue_order), total_props, total_sections, book_id,
+    )
 
     return {
         "status": "started",
         "book_id": book_id,
-        "job_id": jid,
+        "total_batches": len(queue_order),
+        "total_props": total_props,
+        "total_sections": total_sections,
+        "batch_size": batch_size,
         "ready_path": ready_path,
         "prop_path": prop_path,
     }
@@ -664,8 +748,18 @@ def get_qdrant_result(book_id: str):
     if state["failed"] > 0:
         raise HTTPException(500, "Qdrant job failed permanently")
 
-    jid = state["queue"][0]
-    return state["jobs"][jid]["result"]
+    # ── Aggregate stored counts from all batch workers ────────────────────
+    total_stored = 0
+    for jid in state["queue"]:
+        r = state["jobs"][jid].get("result")
+        if r and isinstance(r, dict):
+            total_stored += r.get("chunks_stored", 0)
+        elif r and isinstance(r, (int, float)):
+            total_stored += int(r)
+    return {
+        "chunks_stored": total_stored,
+        "chunks_json": [],  # batch mode — chunks.json written locally by workers
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────

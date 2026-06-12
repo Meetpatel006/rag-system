@@ -54,7 +54,6 @@ Called by pipeline_controller.py:
 """
 
 import re
-import concurrent.futures
 from parta.logger import time_it, async_time_it, logger
 import json
 import time
@@ -75,10 +74,6 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 # ─────────────────────────────────────────────────────────────────────────────
 NEO4J_URI  = "neo4j+s://95a8070a.databases.neo4j.io"
 NEO4J_AUTH = ("95a8070a", "39TVuQIDdPNbNnVNgiWGzi_SVl17V-8hetw54nLyI0M")
-
-# Worker count for knowledge-graph chunk processing.
-# Keep 1 if GLiNER is unstable on your CPU; increase to 2/4 for faster graph injection.
-NEO4J_WORKERS = 1
 
 import json
 import collections
@@ -230,12 +225,14 @@ def _load_gliner(base_dir: Path):
             f"        Place offline GLiNER model in portable/gliner/"
         )
 
-    print(f"[NEO4J] Loading GLiNER from {model_dir}...")
+    logger.info(f"[NEO4J] Loading GLiNER from {model_dir}...")
+    t0 = time.time()
     model = GLiNER.from_pretrained(
         str(model_dir),
         local_files_only=True,
     ).to("cpu")
-    print("[NEO4J] ✅ GLiNER loaded.")
+    t1 = time.time()
+    logger.info(f"[NEO4J] ✅ GLiNER loaded in {t1 - t0:.2f}s.")
     return model
 
 
@@ -761,15 +758,14 @@ def _process_chunks(
     progress_callback,
 ) -> Dict:
     """
-    Pass 2: worker-style chunk processing for Layers 2, 3, 4, 5.
-    Workers extract specs/entities/co-occurrence; main thread writes to Neo4j
-    so the Neo4j session is never shared unsafely.
+    Pass 2: sequential chunk processing for Layers 2, 3, 4, 5.
+    Parallelism is handled at the worker level — each worker machine
+    processes its own batch of chunks via run_neo4j_batch().
     """
     total = len(chunks)
     entities_seen = specs_seen = tables_seen = 0
     cooccurrence: Dict[Tuple, Dict] = defaultdict(lambda: {"count": 0, "sections": set()})
-    worker_count = max(1, int(NEO4J_WORKERS))
-    logger.info("[NEO4J] Starting graph worker pool | workers=%s | chunks=%s | book=%s", worker_count, total, book_id)
+    logger.info("[NEO4J] Processing %s chunks for book=%s", total, book_id)
 
     def handle_result(result: Dict):
         nonlocal entities_seen, specs_seen, tables_seen
@@ -790,29 +786,18 @@ def _process_chunks(
 
     def report(done: int):
         pct = 82 + int((done / max(total, 1)) * 13)
-        msg = f"Graph workers processed: {done}/{total} | Entities: {entities_seen} | Specs: {specs_seen} | Tables: {tables_seen}"
+        msg = f"Chunks processed: {done}/{total} | Entities: {entities_seen} | Specs: {specs_seen} | Tables: {tables_seen}"
         if progress_callback:
-            progress_callback(percent=min(pct, 94), stage="Graph Ingestion", message=msg, extra={"chunks_done": done, "total_chunks": total, "workers": worker_count})
+            progress_callback(percent=min(pct, 94), stage="Graph Ingestion", message=msg, extra={"chunks_done": done, "total_chunks": total})
         logger.info("[NEO4J] %s", msg)
 
     args_iter = [(idx, chunk, book_id, gliner_model, sent_tokenize) for idx, chunk in enumerate(chunks)]
     done = 0
-    if worker_count == 1:
-        for args in args_iter:
-            handle_result(_neo4j_chunk_worker(args))
-            done += 1
-            if done % 25 == 0 or done == total:
-                report(done)
-    else:
-        # Thread workers keep one shared loaded model in memory. If your GLiNER build is not
-        # thread-safe, set RAG_NEO4J_WORKERS=1.
-        with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="neo4j-kg-worker") as ex:
-            futures = [ex.submit(_neo4j_chunk_worker, args) for args in args_iter]
-            for fut in concurrent.futures.as_completed(futures):
-                handle_result(fut.result())
-                done += 1
-                if done % 25 == 0 or done == total:
-                    report(done)
+    for args in args_iter:
+        handle_result(_neo4j_chunk_worker(args))
+        done += 1
+        if done % 25 == 0 or done == total:
+            report(done)
 
     logger.info("[NEO4J] Graph worker pool complete | chunks=%s | entities=%s | specs=%s | tables=%s | cooc=%s", total, entities_seen, specs_seen, tables_seen, len(cooccurrence))
     return {
@@ -997,6 +982,109 @@ def run_neo4j_ingestion(
 
     driver.close()
     return log
+
+
+@time_it
+def run_neo4j_batch(
+    book_id:       str,
+    ready_path:    str,
+    base_dir:      str,
+    batch_start:   int,
+    batch_count:   int,
+) -> Dict:
+    """
+    Distributed batch entry point — processes chunks[batch_start : batch_start+batch_count].
+
+    Each worker loads its own GLiNER model, connects to Neo4j independently,
+    and writes its slice.  All Neo4j writes use MERGE so concurrent workers
+    are idempotent and safe.
+
+    Returns dict with keys:
+        sections_written, entities_written, specs_written,
+        tables_written, cooccurrence_edges, elapsed_seconds
+    """
+    from neo4j import GraphDatabase
+
+    ready_file = Path(ready_path)
+    base       = Path(base_dir)
+
+    if not ready_file.exists():
+        raise FileNotFoundError(f"[NEO4J-BATCH] _ready.json not found: {ready_path}")
+
+    # ── Connect to Neo4j ──────────────────────────────────────────────────────
+    logger.info("[NEO4J-BATCH] Connecting to %s ...", NEO4J_URI)
+    try:
+        driver = GraphDatabase.driver(NEO4J_URI, auth=NEO4J_AUTH, max_connection_lifetime=200, keep_alive=True)
+        driver.verify_connectivity()
+        logger.info("[NEO4J-BATCH] ✅ Neo4j connected.")
+    except Exception as e:
+        raise RuntimeError(f"[NEO4J-BATCH] Cannot connect to Neo4j: {e}")
+
+    # ── Load models ───────────────────────────────────────────────────────────
+    gliner_model  = _load_gliner(base)
+    sent_tokenize = _load_nltk(base)
+
+    # ── Load data — full file, then slice ─────────────────────────────────────
+    with open(ready_file, "r", encoding="utf-8") as f:
+        all_chunks = json.load(f)
+
+    chunks = all_chunks[batch_start : batch_start + batch_count]
+    if not chunks:
+        driver.close()
+        return {
+            "sections_written": 0, "entities_written": 0,
+            "specs_written": 0, "tables_written": 0,
+            "cooccurrence_edges": 0, "elapsed_seconds": 0,
+        }
+
+    book_title = all_chunks[0].get("book_title", book_id)
+    logger.info(
+        "[NEO4J-BATCH] Processing chunks %d–%d of %d for '%s'",
+        batch_start, batch_start + len(chunks) - 1, len(all_chunks), book_id,
+    )
+
+    t_start = time.perf_counter()
+
+    with driver.session() as session:
+        # Layer 1 — hierarchy (MERGE = idempotent, safe from all workers)
+        _build_hierarchy(session, chunks, book_id, book_title)
+
+        # Layers 2-5 — per-chunk processing
+        stats = _process_chunks(
+            session, chunks, book_id,
+            gliner_model, sent_tokenize,
+            None,  # no progress_callback in batch mode
+        )
+
+        # Layer 4 — flush co-occurrence edges for this batch
+        if stats["cooccurrence"]:
+            _write_cooccurrence_batch(session, stats["cooccurrence"], book_id)
+
+    elapsed = time.perf_counter() - t_start
+    cooc_ct = len(stats["cooccurrence"])
+
+    result = {
+        "sections_written":   len(set(
+            ">>".join(c.get("section_path", []))
+            for c in chunks if c.get("section_path")
+        )),
+        "entities_written":   stats["entities_written"],
+        "specs_written":      stats["specs_written"],
+        "tables_written":     stats["tables_written"],
+        "cooccurrence_edges": cooc_ct,
+        "elapsed_seconds":    round(elapsed, 1),
+        "batch_start":        batch_start,
+        "batch_count":        len(chunks),
+    }
+
+    driver.close()
+    logger.info(
+        "[NEO4J-BATCH] Batch done | chunks=%d–%d | entities=%d | specs=%d | tables=%d | cooc=%d | %.1fs",
+        batch_start, batch_start + len(chunks) - 1,
+        stats["entities_written"], stats["specs_written"],
+        stats["tables_written"], cooc_ct, elapsed,
+    )
+    return result
 
 
 # ─────────────────────────────────────────────────────────────────────────────

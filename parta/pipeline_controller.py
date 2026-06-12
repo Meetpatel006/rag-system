@@ -34,6 +34,7 @@ FIXES vs original provided file:
 
 import concurrent.futures
 import json
+import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -44,6 +45,7 @@ from parta.logger import async_time_it, log_process, logger, time_it
 # Config
 # ---------------------------------------------------------------------------
 BASE_DIR = Path(__file__).resolve().parent
+EXTRACTION_SERVER_URL = os.environ.get("EXTRACTION_SERVER_URL", "http://127.0.0.1:8004")
 
 
 @time_it
@@ -107,7 +109,6 @@ def _run_qdrant_stage(job_id, book_id, ready_path, prop_path, jobs_col):
         from pathlib import Path
         import json
 
-        EXTRACTION_SERVER_URL = "http://localhost:8004"
         
         # 1. Start job
         resp = requests.post(
@@ -193,7 +194,6 @@ def _run_neo4j_stage(job_id, book_id, ready_path, jobs_col):
         import requests
         import time
 
-        EXTRACTION_SERVER_URL = "http://localhost:8004"
         
         # 1. Start job
         resp = requests.post(

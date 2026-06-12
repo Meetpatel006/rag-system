@@ -14,6 +14,7 @@ All worker management, fault tolerance, and retries are handled
 inside extraction_server.py — this file has no worker logic.
 """
 
+import os
 import time
 from pathlib import Path
 
@@ -21,9 +22,8 @@ import requests
 
 from parta.logger import log_process, logger, time_it
 
-# ── Config ────────────────────────────────────────────────────────────────────
-# URL of extraction_server.py running on Master Node port 8004
-EXTRACTION_SERVER_URL = "http://localhost:8004"
+# URL of extraction_server.py
+EXTRACTION_SERVER_URL = os.environ.get("EXTRACTION_SERVER_URL", "http://127.0.0.1:8004")
 POLL_INTERVAL_SEC = 5
 
 

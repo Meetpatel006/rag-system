@@ -60,7 +60,6 @@ Called by pipeline_controller.py:
 """
 
 import json
-import concurrent.futures
 from parta.logger import time_it, async_time_it, logger
 import time
 import uuid
@@ -79,10 +78,6 @@ COLLECTION_PROPS     = "RAG_PROPOSITIons"
 COLLECTION_SECTIONS  = "RAG_sections"
 EMBEDDING_DIM        = 768             # Nomic embed-text-v1.5 output size
 BATCH_SIZE           = 64              # points per upsert call
-
-# Worker count for vector ingestion batches.
-# Keep 1 for maximum stability; increase to 2/4 if your embedding model/client are stable.
-QDRANT_WORKERS       = 1
 
 # Nomic prefix — required for correct embedding behaviour
 NOMIC_QUERY_PREFIX   = "search_document: "
@@ -110,13 +105,15 @@ def _get_embed_model(base_dir: str):
             f"         Place the offline nomic model in portable/nomic/"
         )
 
-    print(f"[QDRANT] Loading Nomic embedding model from {model_path}...")
+    logger.info(f"[QDRANT] Loading Nomic embedding model from {model_path}...")
+    t0 = time.time()
     _embed_model = SentenceTransformer(
         str(model_path),
         trust_remote_code=True,
         device="cpu",
     )
-    print("[QDRANT] ✅ Nomic model loaded.")
+    t1 = time.time()
+    logger.info(f"[QDRANT] ✅ Nomic model loaded in {t1 - t0:.2f}s.")
     return _embed_model
 
 
@@ -215,13 +212,9 @@ def _embed_batch(model, texts: List[str]) -> List[List[float]]:
 
 @time_it
 def _embed_batches_with_workers(model, batches: List[List[str]]) -> List[List[List[float]]]:
-    """Worker-style embedding for prepared batches. Order is preserved."""
-    worker_count = max(1, int(QDRANT_WORKERS))
-    if worker_count == 1 or len(batches) <= 1:
-        return [_embed_batch(model, batch) for batch in batches]
-    logger.info("[QDRANT] Starting embedding worker pool | workers=%s | batches=%s", worker_count, len(batches))
-    with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="qdrant-vector-worker") as ex:
-        return list(ex.map(lambda b: _embed_batch(model, b), batches))
+    """Embeds prepared batches sequentially. Cross-machine parallelism is
+    handled at the worker level via run_qdrant_batch()."""
+    return [_embed_batch(model, batch) for batch in batches]
 
 
 @time_it
@@ -557,7 +550,7 @@ def run_qdrant_ingestion(
 
     print(f"\n[QDRANT] Starting dual-collection ingestion for '{book_id}'")
     print(f"[QDRANT] {len(propositions)} propositions | {len(chunks)} sections")
-    logger.info("[QDRANT] Starting vector ingestion | book=%s | workers=%s | propositions=%s | sections=%s", book_id, QDRANT_WORKERS, len(propositions), len(chunks))
+    logger.info("[QDRANT] Starting vector ingestion | book=%s | propositions=%s | sections=%s", book_id, len(propositions), len(chunks))
 
     t_start    = time.perf_counter()
     items_done = 0
@@ -629,6 +622,133 @@ def run_qdrant_ingestion(
     _write_chunks_log(chunks, book_id, base_dir, prop_count, sect_count)
 
     return total_stored
+
+
+@time_it
+def run_qdrant_batch(
+    book_id:       str,
+    ready_path:    str,
+    prop_path:     str,
+    base_dir:      str,
+    batch_start:   int,
+    batch_count:   int,
+    batch_kind:    str = "propositions",
+) -> int:
+    """
+    Distributed batch entry point — processes a slice of propositions OR sections.
+
+    batch_kind:
+        "propositions" → embeds propositions[batch_start : batch_start+batch_count]
+        "sections"     → embeds chunks[batch_start : batch_start+batch_count]
+
+    Each worker loads its own Nomic model, connects to Qdrant independently.
+    Upserts use deterministic point IDs so concurrent workers are idempotent.
+
+    Returns:
+        int — number of vectors stored by this batch
+    """
+    from qdrant_client import models as qm
+
+    model  = _get_embed_model(base_dir)
+    client = _get_qdrant_client()
+
+    _ensure_collection(client, COLLECTION_PROPS)
+    _ensure_collection(client, COLLECTION_SECTIONS)
+
+    t_start = time.perf_counter()
+
+    if batch_kind == "propositions":
+        with open(prop_path, "r", encoding="utf-8") as f:
+            all_props = json.load(f)
+        items = all_props[batch_start : batch_start + batch_count]
+        logger.info(
+            "[QDRANT-BATCH] Embedding propositions %d–%d of %d for '%s'",
+            batch_start, batch_start + len(items) - 1, len(all_props), book_id,
+        )
+
+        batch_texts = []
+        batch_meta  = []
+        prepared_batches = []
+
+        def _flush(texts, metas):
+            if texts:
+                prepared_batches.append((list(texts), list(metas)))
+
+        for prop in items:
+            text = prop.get("text", "").strip()
+            if not text:
+                continue
+            point_id = _point_id(book_id, COLLECTION_PROPS, prop["proposition_id"])
+            payload = {
+                "book_id":         book_id,
+                "parent_chunk_id": prop.get("parent_chunk_id"),
+                "section_path":    prop.get("section_path", []),
+                "page":            prop.get("page", 0),
+                "source_type":     prop.get("source_type", "text"),
+                "text":            text,
+            }
+            batch_texts.append(text)
+            batch_meta.append({"point_id": point_id, "payload": payload})
+            if len(batch_texts) >= BATCH_SIZE:
+                _flush(batch_texts, batch_meta)
+                batch_texts, batch_meta = [], []
+
+        _flush(batch_texts, batch_meta)
+        stored = _upsert_prepared_batches(client, COLLECTION_PROPS, prepared_batches, model)
+
+    else:  # sections
+        with open(ready_path, "r", encoding="utf-8") as f:
+            all_chunks = json.load(f)
+        items = all_chunks[batch_start : batch_start + batch_count]
+        logger.info(
+            "[QDRANT-BATCH] Embedding sections %d–%d of %d for '%s'",
+            batch_start, batch_start + len(items) - 1, len(all_chunks), book_id,
+        )
+
+        batch_texts = []
+        batch_meta  = []
+        prepared_batches = []
+
+        def _flush(texts, metas):
+            if texts:
+                prepared_batches.append((list(texts), list(metas)))
+
+        for chunk in items:
+            chunk_type = chunk.get("type", "text")
+            chunk_id   = chunk.get("chunk_id", "")
+            if chunk_type == "text":
+                text = chunk.get("content", "").strip()
+            else:
+                text = (chunk.get("linearized_text", "").strip()
+                        or chunk.get("content", "").strip())
+            if not text or len(text) < 20:
+                continue
+            point_id = _point_id(book_id, COLLECTION_SECTIONS, chunk_id)
+            page_range = chunk.get("page_range", {"start": 0, "end": 0})
+            payload = {
+                "book_id":      book_id,
+                "chunk_id":     chunk_id,
+                "section_path": chunk.get("section_path", []),
+                "page_range":   page_range,
+                "chunk_type":   chunk_type,
+                "parent_id":    chunk.get("parent_id"),
+                "text":         text,
+            }
+            batch_texts.append(text)
+            batch_meta.append({"point_id": point_id, "payload": payload})
+            if len(batch_texts) >= BATCH_SIZE:
+                _flush(batch_texts, batch_meta)
+                batch_texts, batch_meta = [], []
+
+        _flush(batch_texts, batch_meta)
+        stored = _upsert_prepared_batches(client, COLLECTION_SECTIONS, prepared_batches, model)
+
+    elapsed = time.perf_counter() - t_start
+    logger.info(
+        "[QDRANT-BATCH] Batch done | kind=%s | %d–%d | stored=%d | %.1fs",
+        batch_kind, batch_start, batch_start + len(items) - 1, stored, elapsed,
+    )
+    return stored
 
 
 # ─────────────────────────────────────────────────────────────────────────────
