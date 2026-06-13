@@ -114,6 +114,20 @@ GLINER_MAX_CHARS = 500
 # Minimum sentence length to run GLiNER on (avoids wasting time on fragments)
 MIN_SENTENCE_CHARS = 20
 
+def robust_session_run(session, query, **kwargs):
+    from neo4j.exceptions import TransientError
+    import time
+    import random
+    max_retries = 7
+    for attempt in range(max_retries):
+        try:
+            return session.run(query, **kwargs)
+        except TransientError as e:
+            if attempt == max_retries - 1:
+                raise e
+            logger.warning("[NEO4J] TransientError detected (Deadlock). Retrying attempt %d...", attempt + 1)
+            time.sleep(0.5 + random.random() * 2.0)
+
 # ─────────────────────────────────────────────────────────────────────────────
 # LAYER 2 — SPECIFICATION REGEX
 # ─────────────────────────────────────────────────────────────────────────────
@@ -369,7 +383,7 @@ def _build_hierarchy(
     print(f"[NEO4J] Layer 1: Building document hierarchy...")
 
     # MERGE Book node
-    session.run(
+    robust_session_run(session,
         """
         MERGE (b:Book {id: $bid})
         ON CREATE SET b.title = $title, b.ingested_at = datetime()
@@ -404,7 +418,7 @@ def _build_hierarchy(
 
             if depth == 0:
                 # Chapter level
-                session.run(
+                robust_session_run(session,
                     """
                     MATCH (b:Book {id: $bid})
                     MERGE (c:Chapter {name: $name, book_id: $bid})
@@ -415,7 +429,7 @@ def _build_hierarchy(
                 )
             elif depth == 1:
                 # Section level
-                session.run(
+                robust_session_run(session,
                     """
                     MATCH (c:Chapter {name: $parent, book_id: $bid})
                     MERGE (s:Section {name: $name, book_id: $bid})
@@ -426,7 +440,7 @@ def _build_hierarchy(
                 )
             elif depth == 2:
                 # Subsection level
-                session.run(
+                robust_session_run(session,
                     """
                     MATCH (s:Section {name: $parent, book_id: $bid})
                     MERGE (ss:Subsection {name: $name, book_id: $bid})
@@ -451,7 +465,7 @@ def _build_hierarchy(
             level2_ordered.append(s)
 
     for i in range(len(level2_ordered) - 1):
-        session.run(
+        robust_session_run(session,
             """
             MATCH (a:Section {name: $a, book_id: $bid})
             MATCH (b:Section {name: $b, book_id: $bid})
@@ -477,7 +491,7 @@ def _write_specifications(session, specs: List[Dict], section_name: str, book_id
     Writes Spec nodes and HAS_SPECIFICATION edges for one chunk's specs.
     """
     for spec in specs:
-        session.run(
+        robust_session_run(session,
             """
             MERGE (e:Entity {name: $subject, book_id: $bid})
             ON CREATE SET e.type = 'equipment', e.source = 'spec_regex'
@@ -523,7 +537,7 @@ def _write_entity_section_links(
     """
     for ent in entities:
         # Try to match section or subsection
-        session.run(
+        robust_session_run(session,
             """
             MERGE (e:Entity {name: $name, book_id: $bid})
             ON CREATE SET e.type = $etype, e.raw = $raw
@@ -582,7 +596,7 @@ def _write_cooccurrence_batch(
     written = 0
     for i in range(0, len(batch), chunk_size):
         chunk = batch[i:i + chunk_size]
-        session.run(
+        robust_session_run(session,
             """
             UNWIND $batch AS row
             MATCH (a:Entity {name: row.na, book_id: $bid})
@@ -635,7 +649,7 @@ def _write_table_nodes(
     table_title = f"{section_name} — Table"
 
     # MERGE Table node linked to parent Section/Subsection
-    session.run(
+    robust_session_run(session,
         """
         MERGE (t:Table {id: $tid, book_id: $bid})
         ON CREATE SET
@@ -685,7 +699,7 @@ def _write_table_nodes(
         )
         unit = lowered.get("unit") or lowered.get("units") or ""
 
-        session.run(
+        robust_session_run(session,
             """
             MERGE (r:TableRow {id: $rid, book_id: $bid})
             ON CREATE SET

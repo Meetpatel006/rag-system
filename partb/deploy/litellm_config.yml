@@ -1,9 +1,17 @@
 model_list:
-  # Local Models (Commented out as requested)
-  # - model_name: "gemma3:1b"
-  #   litellm_params:
-  #     model: "ollama/gemma3:1b"
-  #     api_base: "http://localhost:11434"
+  # Local Models on Modal
+  - model_name: "base-gemma"
+    litellm_params:
+      model: "ollama/gemma3:1b"
+      api_base: "https://gcet--ollama-base-model-ollamabase-serve.modal.run"
+  - model_name: "medium-mistral"
+    litellm_params:
+      model: "ollama/mistral:7b"
+      api_base: "https://gcet--ollama-medium-model-ollamamedium-serve.modal.run"
+  - model_name: "deep-qwen"
+    litellm_params:
+      model: "ollama/qwen3.5:9b"
+      api_base: "https://gcet--ollama-deep-model-ollamadeep-serve.modal.run"
 
   # Mistral Cloud Models
   - model_name: "open-mistral-nemo"

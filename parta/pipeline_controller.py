@@ -144,14 +144,14 @@ def _run_qdrant_stage(job_id, book_id, ready_path, prop_path, jobs_col):
         # 3. Get result
         res = requests.get(f"{EXTRACTION_SERVER_URL}/get_qdrant_result/{book_id}", timeout=60).json()
         chunks_stored = res.get("chunks_stored", 0)
-        chunks_json = res.get("chunks_json", [])
 
-        # 4. Write local _chunks.json for confidence report
-        out_dir = Path(BASE_DIR) / "data" / "qdrant"
-        out_dir.mkdir(parents=True, exist_ok=True)
-        out_path = out_dir / f"{book_id}_chunks.json"
-        with open(out_path, "w", encoding="utf-8") as f:
-            json.dump(chunks_json, f, indent=2, ensure_ascii=False)
+        # 4. Write local _chunks.json for confidence report using _write_chunks_log
+        from processing.ingest_qdrant import _write_chunks_log
+        with open(ready_path, "r", encoding="utf-8") as f:
+            ready_chunks = json.load(f)
+        with open(prop_path, "r", encoding="utf-8") as f:
+            props = json.load(f)
+        _write_chunks_log(ready_chunks, book_id, str(BASE_DIR), len(props), len(ready_chunks))
 
         jobs_col.update_one(
             {"job_id": job_id},

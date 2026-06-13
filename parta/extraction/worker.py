@@ -8,16 +8,23 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
+
 import time
 import requests
 import uuid
 import tempfile
 import os
+import multiprocessing
 from pypdf import PdfReader
 from parta.logger import time_it
 
-SERVER_URL = "http://localhost:8004"
-WORKER_ID = f"worker-{uuid.uuid4().hex[:6]}"
+# --- CONFIGURATION ---
+SERVER_URL = "http://127.0.0.1:8004"
+WORKERS_COUNT = 5  # Change this variable to manually setup the number of parallel workers
+# ---------------------
 
 @time_it
 def process_chunk(pdf_bytes: bytes, start_offset: int) -> str:
@@ -37,12 +44,12 @@ def process_chunk(pdf_bytes: bytes, start_offset: int) -> str:
     finally:
         os.remove(tmp_path)
 
-def start_worker():
-    print(f"[{WORKER_ID}] Starting single extraction worker...")
+def start_worker(worker_id: str):
+    print(f"[{worker_id}] Starting extraction worker connected to {SERVER_URL}...")
     
     while True:
         try:
-            resp = requests.get(f"{SERVER_URL}/get_job", params={"worker_id": WORKER_ID})
+            resp = requests.get(f"{SERVER_URL}/get_job", params={"worker_id": worker_id})
             
             if resp.status_code != 200:
                 time.sleep(5)
@@ -61,37 +68,48 @@ def start_worker():
                 chunk_idx = data["chunk_idx"]
                 start_offset = data.get("start_offset", 0)
                 
-                print(f"[{WORKER_ID}] Got chunk {chunk_idx} for book {book_id}. Downloading...")
+                print(f"[{worker_id}] Got chunk {chunk_idx} for book {book_id}. Downloading...")
                 
                 chunk_resp = requests.get(f"{SERVER_URL}/chunk/{job_id}", stream=True)
                 if chunk_resp.status_code == 200:
                     try:
                         content = process_chunk(chunk_resp.content, start_offset)
-                        print(f"[{WORKER_ID}] Extraction success for chunk {chunk_idx}. Submitting...")
+                        print(f"[{worker_id}] Extraction success for chunk {chunk_idx}. Submitting...")
                         
                         requests.post(f"{SERVER_URL}/submit_result", json={
                             "job_id": job_id,
-                            "worker_id": WORKER_ID,
+                            "worker_id": worker_id,
                             "success": True,
                             "content": content
                         })
                     except Exception as e:
-                        print(f"[{WORKER_ID}] Extraction failed for chunk {chunk_idx}: {e}")
+                        print(f"[{worker_id}] Extraction failed for chunk {chunk_idx}: {e}")
                         requests.post(f"{SERVER_URL}/submit_result", json={
                             "job_id": job_id,
-                            "worker_id": WORKER_ID,
+                            "worker_id": worker_id,
                             "success": False,
                             "content": ""
                         })
                 else:
-                    print(f"[{WORKER_ID}] Failed to download chunk {job_id}")
+                    print(f"[{worker_id}] Failed to download chunk {job_id}")
                     
         except requests.exceptions.ConnectionError:
-            print(f"[{WORKER_ID}] Cannot reach server at {SERVER_URL}. Waiting...")
+            print(f"[{worker_id}] Cannot reach server at {SERVER_URL}. Waiting...")
             time.sleep(5)
         except Exception as e:
-            print(f"[{WORKER_ID}] Error: {e}")
+            print(f"[{worker_id}] Error: {e}")
             time.sleep(5)
 
 if __name__ == "__main__":
-    start_worker()
+    processes = []
+    print(f"Starting {WORKERS_COUNT} parallel local workers connecting to {SERVER_URL}...")
+    
+    for i in range(WORKERS_COUNT):
+        worker_id = f"worker-{i+1}-{uuid.uuid4().hex[:4]}"
+        p = multiprocessing.Process(target=start_worker, args=(worker_id,))
+        p.start()
+        processes.append(p)
+        time.sleep(0.5) # stagger startup
+        
+    for p in processes:
+        p.join()

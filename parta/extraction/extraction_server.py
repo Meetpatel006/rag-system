@@ -42,6 +42,13 @@ QDRANT_BATCH_SIZE = 200  # items per qdrant worker batch
 
 app = FastAPI(title="Unified Job Server")
 
+# ── Modal Cloud Workers Config ────────────────────────────────────────────────
+SPAWN_MODAL_WORKERS = True
+MODAL_WORKERS_PER_JOB = 5
+# Replace this with your Ngrok or public URL so the cloud workers can reach this local server (e.g., "https://xyz.ngrok-free.app")
+PUBLIC_SERVER_URL = "https://cpzl92xl.taskhub.me"
+# ──────────────────────────────────────────────────────────────────────────────
+
 # ── Config ────────────────────────────────────────────────────────────────────
 CHUNK_SIZE = 10
 LEASE_SECONDS = 600
@@ -409,6 +416,16 @@ def start_extraction(payload: dict):
 
     logger.info("%d extraction chunks queued for '%s'", state["total"], book_id)
 
+    if SPAWN_MODAL_WORKERS:
+        try:
+            import modal
+            text_worker = modal.Function.from_name("rag-workers", "run_text_worker")
+            logger.info(f"Spawning {MODAL_WORKERS_PER_JOB} Text workers on Modal...")
+            for _ in range(MODAL_WORKERS_PER_JOB):
+                text_worker.spawn(PUBLIC_SERVER_URL)
+        except Exception as e:
+            logger.error(f"Failed to spawn Modal workers: {e}")
+
     return {
         "status": "started",
         "book_id": book_id,
@@ -571,6 +588,16 @@ def start_neo4j(payload: dict):
         len(queue_order), total_chunks, book_id,
     )
 
+    if SPAWN_MODAL_WORKERS:
+        try:
+            import modal
+            neo4j_worker = modal.Function.from_name("rag-workers", "run_neo4j_worker")
+            logger.info(f"Spawning {MODAL_WORKERS_PER_JOB} Neo4j workers on Modal...")
+            for _ in range(MODAL_WORKERS_PER_JOB):
+                neo4j_worker.spawn(PUBLIC_SERVER_URL)
+        except Exception as e:
+            logger.error(f"Failed to spawn Modal workers: {e}")
+
     return {
         "status": "started",
         "book_id": book_id,
@@ -702,6 +729,16 @@ def start_qdrant(payload: dict):
         "Qdrant split into %d batches (%d props + %d sections) for '%s'",
         len(queue_order), total_props, total_sections, book_id,
     )
+
+    if SPAWN_MODAL_WORKERS:
+        try:
+            import modal
+            qdrant_worker = modal.Function.from_name("rag-workers", "run_qdrant_worker")
+            logger.info(f"Spawning {MODAL_WORKERS_PER_JOB} Qdrant workers on Modal...")
+            for _ in range(MODAL_WORKERS_PER_JOB):
+                qdrant_worker.spawn(PUBLIC_SERVER_URL)
+        except Exception as e:
+            logger.error(f"Failed to spawn Modal workers: {e}")
 
     return {
         "status": "started",

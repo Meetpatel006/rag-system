@@ -1,0 +1,17 @@
+fastapi
+uvicorn
+pypdf
+PyMuPDF
+requests
+bcrypt
+PyJWT
+python-multipart
+neo4j
+qdrant-client
+pymongo
+motor
+sentence-transformers
+nltk
+einops
+gliner
+litellm[proxy]

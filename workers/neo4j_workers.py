@@ -15,7 +15,7 @@ from parta.processing.ingest_neo4j import run_neo4j_batch
 
 SERVER_URL = os.environ.get("SERVER_URL", "http://127.0.0.1:8004")
 WORKER_ID  = f"neo4j-{uuid.uuid4().hex[:6]}"
-BASE_DIR   = Path(__file__).resolve().parent.parent
+BASE_DIR   = Path(__file__).resolve().parent.parent / "parta"
 
 # ── persistent session — reuses TCP connection across all poll cycles ─────────
 _session = requests.Session()
@@ -27,6 +27,9 @@ logger.info(f"[{WORKER_ID}] BASE_DIR : {BASE_DIR}")
 logger.info("=" * 80)
 is_connected = False
 
+wait_count = 0
+MAX_WAITS = 15
+
 while True:
     job_id  = None
     book_id = None
@@ -36,7 +39,7 @@ while True:
         r = _session.get(
             f"{SERVER_URL}/get_neo4j_job",
             params={"worker_id": WORKER_ID},
-            timeout=30,
+            timeout=1800,
         )
 
         if not is_connected:
@@ -50,8 +53,14 @@ while True:
 
         job = r.json()
         if job.get("action") != "PROCESS":
+            wait_count += 1
+            if wait_count >= MAX_WAITS:
+                logger.info(f"[{WORKER_ID}] No jobs received for {MAX_WAITS * 2}s. Exiting gracefully.")
+                break
             time.sleep(2)
             continue
+        
+        wait_count = 0
 
         job_id       = job.get("job_id")
         book_id      = job.get("book_id")
@@ -70,7 +79,7 @@ while True:
         logger.info(f"[{WORKER_ID}] Downloading ready file for '{book_id}'...")
         r2 = _session.get(
             f"{SERVER_URL}/download_ready/{book_id}",
-            timeout=60,
+            timeout=1800,
         )
         if r2.status_code != 200:
             raise RuntimeError(
@@ -109,7 +118,7 @@ while True:
                 "success":   True,
                 "content":   result,
             },
-            timeout=30,
+            timeout=1800,
         )
 
         if response.status_code == 200:
@@ -139,7 +148,7 @@ while True:
                         "success":   False,
                         "content":   "",
                     },
-                    timeout=30,
+                    timeout=1800,
                 )
             except Exception as e:
                 logger.error(f"[{WORKER_ID}] Error submitting failure: {e}")

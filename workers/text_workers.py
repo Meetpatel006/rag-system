@@ -233,6 +233,9 @@ def start_worker():
     logger.info(f"[{WORKER_ID}] BASE_DIR : {Path(__file__).resolve().parent.parent}")
     logger.info("=" * 80)
 
+    wait_count = 0
+    MAX_WAITS = 15
+
     while True:
         try:
             resp = _session.get(
@@ -253,10 +256,15 @@ def start_worker():
             action = data.get("action")
 
             if action == "WAIT":
+                wait_count += 1
+                if wait_count >= MAX_WAITS:
+                    logger.info(f"[{WORKER_ID}] No jobs received for {MAX_WAITS * WAIT_SLEEP}s. Exiting gracefully.")
+                    break
                 time.sleep(WAIT_SLEEP)
                 continue
 
             if action == "PROCESS":
+                wait_count = 0
                 job_id = data["job_id"]
                 book_id = data["book_id"]
                 chunk_idx = data["chunk_idx"]
@@ -279,16 +287,21 @@ def start_worker():
                             f"[{WORKER_ID}] Extraction success for chunk {chunk_idx}. Submitting."
                         )
 
-                        _session.post(
-                            f"{SERVER_URL}/submit_result",
-                            json={
-                                "job_id": job_id,
-                                "worker_id": WORKER_ID,
-                                "success": True,
-                                "content": content,
-                            },
-                            timeout=REQUEST_TIMEOUT,
-                        )
+                        for attempt in range(5):
+                            submit_resp = _session.post(
+                                f"{SERVER_URL}/submit_result",
+                                json={
+                                    "job_id": job_id,
+                                    "worker_id": WORKER_ID,
+                                    "success": True,
+                                    "content": content,
+                                },
+                                timeout=REQUEST_TIMEOUT,
+                            )
+                            if submit_resp.status_code == 200:
+                                break
+                            logger.warning(f"[{WORKER_ID}] Submit failed with {submit_resp.status_code}. Retrying...")
+                            time.sleep(2)
 
                     except Exception as e:
                         logger.error(
