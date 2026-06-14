@@ -8,3 +8,6 @@ wheel
 *exe
 evals/
 temp_extract*
+.*whl
+*.tar.gz
+.*zip
