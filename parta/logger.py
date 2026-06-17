@@ -10,6 +10,8 @@ time_it         : decorator — sync functions; aggregates `_`-prefix & fast cal
 async_time_it   : decorator — async functions; same rules as time_it
 log_process     : decorator — sync functions; ALWAYS logs START + DONE + total time
 async_log_process: decorator — async version of log_process
+worker_log_process: decorator — logs START + DONE with a specific worker_id
+async_worker_log_process: decorator — async version of worker_log_process
 TimeItContext   : context manager — times named code blocks
 
 Rules
@@ -28,6 +30,8 @@ import logging
 import os
 import sys
 import time
+import threading
+import requests
 from pathlib import Path
 from typing import Any, Callable
 
@@ -54,6 +58,30 @@ if not logger.handlers:
     _sh = logging.StreamHandler(sys.stdout)
     _sh.setFormatter(_FMT)
     logger.addHandler(_sh)
+
+    # ── Monitor Dashboard Handler (Non-blocking) ──
+    class MonitorHttpHandler(logging.Handler):
+        def __init__(self, url="http://127.0.0.1:8080/api/log"):
+            super().__init__()
+            self.url = url
+            self.session = requests.Session()
+
+        def emit(self, record):
+            try:
+                msg = self.format(record)
+                def send():
+                    try:
+                        self.session.post(self.url, json={"log": msg}, timeout=0.2)
+                    except Exception:
+                        pass
+                # Fire and forget in a daemon thread so it never blocks the worker
+                threading.Thread(target=send, daemon=True).start()
+            except Exception:
+                pass
+
+    _http = MonitorHttpHandler()
+    _http.setFormatter(_FMT)
+    logger.addHandler(_http)
 
 # ─── Aggregated stats for internal / fast functions ──────────────────────────
 _agg: dict[str, dict] = {}
@@ -200,6 +228,55 @@ def async_log_process(func: Callable) -> Callable:
             raise
 
     return wrapper
+
+
+# ─── worker_log_process ──────────────────────────────────────────────────────
+def worker_log_process(worker_id: str) -> Callable:
+    """
+    Decorator for worker processes.
+    Like log_process, but prefixes all logs with the provided worker_id.
+    """
+    def decorator(func: Callable) -> Callable:
+        _name = _label(func)
+
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs) -> Any:
+            logger.info("┌─ START  [%s] %s", worker_id, _name)
+            t0 = time.perf_counter()
+            try:
+                result = func(*args, **kwargs)
+                elapsed = time.perf_counter() - t0
+                logger.info("└─ DONE   [%s] %-38s  [total: %.3fs]", worker_id, _name, elapsed)
+                return result
+            except Exception as exc:
+                elapsed = time.perf_counter() - t0
+                logger.error("└─ FAILED [%s] %-38s  [%.3fs]  %s", worker_id, _name, elapsed, exc)
+                raise
+        return wrapper
+    return decorator
+
+
+# ─── async_worker_log_process ────────────────────────────────────────────────
+def async_worker_log_process(worker_id: str) -> Callable:
+    """Async version of worker_log_process."""
+    def decorator(func: Callable) -> Callable:
+        _name = _label(func)
+
+        @functools.wraps(func)
+        async def wrapper(*args, **kwargs) -> Any:
+            logger.info("┌─ START  [%s] %s", worker_id, _name)
+            t0 = time.perf_counter()
+            try:
+                result = await func(*args, **kwargs)
+                elapsed = time.perf_counter() - t0
+                logger.info("└─ DONE   [%s] %-38s  [total: %.3fs]", worker_id, _name, elapsed)
+                return result
+            except Exception as exc:
+                elapsed = time.perf_counter() - t0
+                logger.error("└─ FAILED [%s] %-38s  [%.3fs]  %s", worker_id, _name, elapsed, exc)
+                raise
+        return wrapper
+    return decorator
 
 
 # ─── TimeItContext ────────────────────────────────────────────────────────────

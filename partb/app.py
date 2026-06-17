@@ -76,8 +76,8 @@ _BASE = Path(__file__).resolve().parent
 FRONTEND_DIR = _BASE / "frontend"
 STATIC_DIR = _BASE / "static"
 
-if STATIC_DIR.exists():
-    app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+print(f"[KRUTRIM] STATIC_DIR: {STATIC_DIR}  exists={STATIC_DIR.exists()}")
+app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 app.include_router(auth_router)
 app.include_router(chats_router)

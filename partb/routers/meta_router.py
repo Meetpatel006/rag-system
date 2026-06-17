@@ -35,17 +35,20 @@ def library_col():
 async def list_library(user: dict = Depends(verify_token)):
     books = list(
         library_col()
-        .find({"status": "ready"}, {"_id": 0, "book_id": 1, "book_title": 1, "completed_at": 1})
+        .find({"status": "ready"}, {"_id": 0, "book_id": 1, "book_title": 1, "completed_at": 1, "confidence_report": 1})
         .sort("completed_at", -1)
     )
     out = []
     for b in books:
         bid = b["book_id"]
+        confidence = b.get("confidence_report", {})
+        total_chunks = confidence.get("total_chunks", 0) if isinstance(confidence, dict) else 0
         out.append(
             {
                 "book_id": bid,
                 "title": b.get("book_title", bid),
                 "total_pages": count_pages(bid),
+                "total_chunks": total_chunks,
                 "created_at":(
                     b["completed_at"].isoformat()
                     if isinstance(b.get("completed_at"), datetime)
@@ -160,3 +163,33 @@ async def list_models(_: dict = Depends(verify_token)):
         return r.json()
     except Exception as e:
         raise HTTPException(503, f"LiteLLM unreachable: {e}") from e
+
+@router.delete("/books/{book_id}")
+@async_time_it
+async def delete_book(book_id: str, user: dict = Depends(verify_token)):
+    from partb.retrieval.pipeline import get_neo4j, get_qdrant
+    from qdrant_client.http import models
+
+    try:
+        with get_neo4j().session() as s:
+            s.run("MATCH (n) WHERE n.book_id = $book_id DETACH DELETE n", book_id=book_id)
+
+        qc = get_qdrant()
+        filter_query = models.Filter(
+            must=[models.FieldCondition(key="book_id", match=models.MatchValue(value=book_id))]
+        )
+        for col in [COLLECTION_PROPS, COLLECTION_SECTIONS]:
+            try:
+                qc.delete(
+                    collection_name=col,
+                    points_selector=models.FilterSelector(filter=filter_query)
+                )
+            except Exception:
+                pass
+
+        library_col().delete_one({"book_id": book_id})
+
+        return {"status": "success", "message": f"Book {book_id} deleted"}
+    except Exception as e:
+        raise HTTPException(500, f"Delete failed: {e}")
+

@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from parta.logger import logger
+from parta.logger import logger, worker_log_process
 
 import requests
 from parta.processing.ingest_qdrant import run_qdrant_batch
@@ -25,6 +25,18 @@ logger.info(f"[{WORKER_ID}] SERVER   : {SERVER_URL}")
 logger.info(f"[{WORKER_ID}] BASE_DIR : {BASE_DIR}")
 logger.info("=" * 80)
 is_connected = False
+
+@worker_log_process(WORKER_ID)
+def execute_qdrant_batch(book_id, ready_path, prop_path, batch_start, batch_count, batch_kind):
+    return run_qdrant_batch(
+        book_id=book_id,
+        ready_path=ready_path,
+        prop_path=prop_path,
+        base_dir=str(BASE_DIR),
+        batch_start=batch_start,
+        batch_count=batch_count,
+        batch_kind=batch_kind,
+    )
 
 wait_count = 0
 MAX_WAITS = 15
@@ -116,20 +128,9 @@ while True:
         logger.info(f"[{WORKER_ID}] Files ready — running batch ingestion ({batch_kind} {batch_start}–{batch_start + batch_count - 1})...")
 
         # ── run batch ingestion ────────────────────────────────────────────────
-        start_time = time.time()
-
-        chunks_stored = run_qdrant_batch(
-            book_id=book_id,
-            ready_path=local_ready_path,
-            prop_path=local_prop_path,
-            base_dir=str(BASE_DIR),
-            batch_start=batch_start,
-            batch_count=batch_count,
-            batch_kind=batch_kind,
+        chunks_stored = execute_qdrant_batch(
+            book_id, local_ready_path, local_prop_path, batch_start, batch_count, batch_kind
         )
-
-        elapsed = round(time.time() - start_time, 2)
-        logger.info(f"[{WORKER_ID}] Qdrant batch completed in {elapsed}s — stored={chunks_stored}")
 
         # ── submit success ─────────────────────────────────────────────────────
         response = _session.post(

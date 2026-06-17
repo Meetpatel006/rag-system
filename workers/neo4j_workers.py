@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from parta.logger import logger
+from parta.logger import logger, worker_log_process
 
 import requests
 
@@ -26,6 +26,16 @@ logger.info(f"[{WORKER_ID}] SERVER   : {SERVER_URL}")
 logger.info(f"[{WORKER_ID}] BASE_DIR : {BASE_DIR}")
 logger.info("=" * 80)
 is_connected = False
+
+@worker_log_process(WORKER_ID)
+def execute_neo4j_batch(book_id, ready_path, batch_start, batch_count):
+    return run_neo4j_batch(
+        book_id=book_id,
+        ready_path=ready_path,
+        base_dir=str(BASE_DIR),
+        batch_start=batch_start,
+        batch_count=batch_count,
+    )
 
 wait_count = 0
 MAX_WAITS = 15
@@ -95,19 +105,9 @@ while True:
         logger.info(f"[{WORKER_ID}] Ready file saved to {local_ready_path}")
 
         # ── run batch ingestion ────────────────────────────────────────────────
-        logger.info(f"[{WORKER_ID}] Starting Neo4j batch ingestion (chunks {batch_start}–{batch_start + batch_count - 1})...")
-        start_time = time.time()
-
-        result = run_neo4j_batch(
-            book_id=book_id,
-            ready_path=local_ready_path,
-            base_dir=str(BASE_DIR),
-            batch_start=batch_start,
-            batch_count=batch_count,
-        )
-
-        elapsed = round(time.time() - start_time, 2)
-        logger.info(f"[{WORKER_ID}] Neo4j batch completed in {elapsed}s — entities={result.get('entities_written', 0)}, specs={result.get('specs_written', 0)}")
+        result = execute_neo4j_batch(book_id, local_ready_path, batch_start, batch_count)
+        
+        logger.info(f"[{WORKER_ID}] Neo4j batch completed — entities={result.get('entities_written', 0)}, specs={result.get('specs_written', 0)}")
 
         # ── submit success ─────────────────────────────────────────────────────
         response = _session.post(

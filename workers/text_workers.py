@@ -28,7 +28,7 @@ try:
 except ImportError:
     import fitz
 
-from parta.logger import time_it, logger
+from parta.logger import time_it, logger, worker_log_process
 
 import os
 
@@ -198,7 +198,7 @@ def _extract_page_text(page) -> str:
     return _extract_two_column_text(blocks, page_width, page_height)
 
 
-@time_it
+@worker_log_process(WORKER_ID)
 def process_chunk(pdf_bytes: bytes, start_offset: int) -> str:
     """
     Extract text from a PDF chunk.
