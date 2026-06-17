@@ -1,11 +1,12 @@
 """
 extraction/worker.py
---------------------
+-------------------
 Single worker for PDF extraction.
 Designed to run alongside extraction_server.py.
 
 This version is layout-aware:
-- uses PyMuPDF
+- uses PyMuPDF for fast mode
+- uses Docling for OCR mode (scanned/image-based PDFs)
 - handles basic single-column pages with natural reading order
 - heuristically handles two-column research-paper pages
 - keeps the same server contract as your current worker
@@ -20,6 +21,15 @@ import time
 import uuid
 from typing import List, Tuple
 
+import os
+
+# Point Docling to the portable model cache (must be set before docling import)
+_DOCLING_MODELS_PATH = os.environ.get(
+    "DOCLING_ARTIFACTS_PATH",
+    str(Path(__file__).resolve().parent.parent / "parta" / "portable" / "docling"),
+)
+os.environ.setdefault("DOCLING_ARTIFACTS_PATH", _DOCLING_MODELS_PATH)
+
 import requests
 
 try:
@@ -28,12 +38,18 @@ try:
 except ImportError:
     import fitz
 
-from parta.logger import time_it, logger, worker_log_process
+try:
+    from docling.document_converter import DocumentConverter
+    HAS_DOCLING = True
+except ImportError:
+    HAS_DOCLING = False
 
-import os
+from logger import logger, worker_log_process, setup_worker_logger
 
 SERVER_URL = os.environ.get("SERVER_URL", "http://127.0.0.1:8004")
-WORKER_ID = f"worker-{uuid.uuid4().hex[:6]}"
+WORKER_ID = f"text-{uuid.uuid4().hex[:6]}"
+
+setup_worker_logger("text", WORKER_ID)
 
 REQUEST_TIMEOUT = 30
 WAIT_SLEEP = 2
@@ -198,12 +214,35 @@ def _extract_page_text(page) -> str:
     return _extract_two_column_text(blocks, page_width, page_height)
 
 
+def _extract_with_docling(pdf_bytes: bytes, start_offset: int) -> str:
+    """
+    Extract text from a PDF chunk using Docling.
+    Handles scanned/image-based PDFs via built-in OCR.
+    """
+    if not HAS_DOCLING:
+        raise RuntimeError(
+            "Docling is not installed. Run: pip install docling"
+        )
+
+    converter = DocumentConverter()
+    result = converter.convert(pdf_bytes)
+    md_text = result.document.export_to_markdown()
+
+    content_parts: List[str] = []
+    content_parts.append(f"\n\n## Page {start_offset + 1}\n\n{md_text}")
+    return "".join(content_parts).strip()
+
+
 @worker_log_process(WORKER_ID)
-def process_chunk(pdf_bytes: bytes, start_offset: int) -> str:
+def process_chunk(pdf_bytes: bytes, start_offset: int, ocr_enabled: bool = False) -> str:
     """
     Extract text from a PDF chunk.
+    Uses Docling (with OCR) when ocr_enabled=True, else uses PyMuPDF fast path.
     Keeps page numbering with start_offset so your downstream pipeline stays unchanged.
     """
+    if ocr_enabled:
+        return _extract_with_docling(pdf_bytes, start_offset)
+
     try:
         content_parts: List[str] = []
 
@@ -269,9 +308,11 @@ def start_worker():
                 book_id = data["book_id"]
                 chunk_idx = data["chunk_idx"]
                 start_offset = data.get("start_offset", 0)
+                ocr_enabled = data.get("ocr_enabled", False)
 
                 logger.info(
-                    f"[{WORKER_ID}] Got chunk {chunk_idx} for book {book_id}. Downloading..."
+                    f"[{WORKER_ID}] Got chunk {chunk_idx} for book {book_id} "
+                    f"(ocr={'yes' if ocr_enabled else 'no'}). Downloading..."
                 )
 
                 chunk_resp = _session.get(
@@ -282,7 +323,7 @@ def start_worker():
 
                 if chunk_resp.status_code == 200:
                     try:
-                        content = process_chunk(chunk_resp.content, start_offset)
+                        content = process_chunk(chunk_resp.content, start_offset, ocr_enabled=ocr_enabled)
                         logger.info(
                             f"[{WORKER_ID}] Extraction success for chunk {chunk_idx}. Submitting."
                         )
@@ -324,6 +365,8 @@ def start_worker():
             if is_connected:
                 logger.error(f"[{WORKER_ID}] Disconnected from server. Waiting to reconnect...")
                 is_connected = False
+            else:
+                logger.error(f"[{WORKER_ID}] Failed to connect to server at {SERVER_URL}. Retrying...")
             time.sleep(ERROR_SLEEP)
 
         except Exception as e:

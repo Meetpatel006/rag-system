@@ -238,6 +238,7 @@ def _assign_pending_job(
                 response["page_count"] = job["page_count"]
             if job.get("chunk_path"):
                 response["chunk_path"] = job["chunk_path"]
+            response["ocr_enabled"] = state.get("meta", {}).get("ocr_enabled", False)
             response.update(extra_response or {})
             return response
 
