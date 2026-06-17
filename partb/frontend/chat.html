@@ -365,7 +365,6 @@
                 letter-spacing: 0.06em;
                 margin-top: 1px;
             }
-            /* Theme toggle disabled
             #theme-toggle {
                 background: none;
                 border: 1px solid var(--hairline);
@@ -388,7 +387,6 @@
             #theme-toggle:active {
                 transform: scale(0.95);
             }
-            */
 
             #app-inner {
                 display: flex;
@@ -2166,14 +2164,12 @@
                         <span class="health-dot"></span>
                         <span>-</span>
                     </span>
-                    <!-- Theme toggle disabled
                     <button id="theme-toggle" onclick="toggleTheme()" title="Toggle theme">
                         <svg viewBox="0 0 24 24" width="16" height="16" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round" stroke-linejoin="round">
                             <circle cx="12" cy="12" r="4"/>
                             <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/>
                         </svg>
                     </button>
-                    -->
                 </div>
             </div>
             <div id="app-inner">
@@ -2209,14 +2205,12 @@
                                     <path d="M12 1v6m0 6v6M4.22 4.22l4.24 4.24m2.12 2.12l4.24 4.24M1 12h6m6 0h6m-17.78 7.78l4.24-4.24m2.12-2.12l4.24-4.24"/>
                                 </svg>
                             </button>
-                            <!-- Theme toggle disabled
                             <button class="sidebar-user-action" onclick="toggleTheme()" title="Toggle theme">
                                 <svg viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round" stroke-linejoin="round">
                                     <circle cx="12" cy="12" r="4"/>
                                     <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/>
                                 </svg>
                             </button>
-                            -->
                         </div>
                     </div>
                 </nav>
@@ -2449,9 +2443,10 @@
             let streaming = false;
             let popupOpen = false;
             let bookViewer = { bookId: null, pageNumber: 1, totalPages: 0 };
+            let lastMessageCounts = {};
+            let syncTimer = null;
 
-            // ── Theme (disabled) ───────────────────────────────────────
-            /*
+            // ── Theme ──────────────────────────────────────────────────
             function toggleTheme() {
                 document.body.classList.toggle("dark");
                 localStorage.setItem(
@@ -2461,7 +2456,6 @@
             }
             if (localStorage.getItem("krutrim_theme") === "dark")
                 document.body.classList.add("dark");
-            */
 
             // ── Marked setup ───────────────────────────────────────────
             function renderMarkdown(text) {
@@ -2575,6 +2569,7 @@
             }
 
             function logout() {
+                if (syncTimer) clearInterval(syncTimer);
                 localStorage.clear();
                 location.reload();
             }
@@ -2589,9 +2584,53 @@
                 }
                 loadChats();
                 checkHealth();
+                startPolling();
             }
 
             if (token && currentUser) bootApp();
+
+            // ── Multi-device sync polling ─────────────────────────────
+            function startPolling() {
+                if (syncTimer) clearInterval(syncTimer);
+                syncTimer = setInterval(pollSync, 5000);
+            }
+
+            async function pollSync() {
+                await loadChats();
+                if (!activeChatId || streaming) return;
+                try {
+                    const res = await apiFetch(`/chats/${activeChatId}`);
+                    if (!res || !res.ok) {
+                        if (res?.status === 404) {
+                            delete lastMessageCounts[activeChatId];
+                            activeChatId = null;
+                            activeChatData = null;
+                            resetChatView();
+                        }
+                        return;
+                    }
+                    const chat = await res.json();
+                    const currentCount = chat.message_count || 0;
+                    const prevCount = lastMessageCounts[activeChatId] || 0;
+                    if (currentCount !== prevCount) {
+                        lastMessageCounts[activeChatId] = currentCount;
+                        const mres = await apiFetch(`/chats/${activeChatId}/messages`);
+                        if (!mres || !mres.ok) return;
+                        const msgs = await mres.json();
+                        const area = document.getElementById("messages-area");
+                        const scrollWasAtBottom = area.scrollHeight - area.scrollTop - area.clientHeight < 80;
+                        area.innerHTML = "";
+                        if (!msgs.length) {
+                            area.innerHTML = '<div style="padding: 40px; color: var(--text-muted); text-align: center; font-size: 13px;">No messages yet. Ask your first question below.</div>';
+                        } else {
+                            msgs.forEach((m) =>
+                                appendMessage(m.role, m.content, m.sources || [], m.mode || chat.default_mode || "balanced", false)
+                            );
+                        }
+                        if (scrollWasAtBottom) area.scrollTop = area.scrollHeight;
+                    }
+                } catch (e) {}
+            }
 
             // ── Health check ───────────────────────────────────────────
             async function checkHealth() {
@@ -2692,6 +2731,7 @@
             async function deleteChat(chatId) {
                 if (!confirm("Delete this chat and all its messages?")) return;
                 await apiFetch(`/chats/${chatId}`, { method: "DELETE" });
+                delete lastMessageCounts[chatId];
                 if (activeChatId === chatId) {
                     activeChatId = null;
                     activeChatData = null;
@@ -2722,6 +2762,7 @@
                     );
                 }
                 area.scrollTop = area.scrollHeight;
+                lastMessageCounts[chatId] = msgs.length || 0;
                 loadChats();
             }
 
@@ -3041,6 +3082,11 @@
                                 asstBubble.appendChild(sourcesEl);
                                 asstBubble.appendChild(actionsEl);
                                 area.scrollTop = area.scrollHeight;
+                                if (lastMessageCounts[activeChatId] !== undefined) {
+                                    lastMessageCounts[activeChatId] += 2;
+                                } else {
+                                    lastMessageCounts[activeChatId] = (activeChatData?.message_count || 0) + 2;
+                                }
                                 loadChats();
                             } else if (evt.type === "error") {
                                 textEl.innerHTML = `<span style="color: var(--danger)">${escHtml(evt.message)}</span>`;

@@ -89,6 +89,25 @@ GLINER_QUERY_THRESHOLD = float(os.environ.get("RAG_GLINER_QUERY_THRESHOLD", "0.3
 BOOST_BOTH = float(os.environ.get("RAG_BOOST_BOTH", "0.12"))
 LONG_CHUNK_WORDS = int(os.environ.get("RAG_LONG_CHUNK_WORDS", "450"))
 
+# ── Reranker tuning ──────────────────────────────────────────────────────────
+# The bundled CrossEncoder is an XLM-RoBERTa model with max_position_embeddings
+# = 514 (~512 usable tokens). Scoring a full section chunk (>400 words) against a
+# query means it is hard-truncated, so the relevant passage often never reaches
+# the model. RERANK_SEGMENT_* control the segment-max workaround: long candidates
+# are split into overlapping segments and scored as the max segment score.
+RERANK_SEGMENT_TOKENS = int(os.environ.get("RAG_RERANK_SEGMENT_TOKENS", "220"))
+RERANK_FULL_CHUNK_WORDS = int(os.environ.get("RAG_RERANK_FULL_CHUNK_WORDS", "400"))
+
+# Drop candidates whose rerank score is below this floor. The bundled reranker's
+# sentence_bert_config.json declares activation_fn=Sigmoid, so scores are in 0..1.
+# Tune empirically after reading the score-distribution logs (rerank_candidates
+# logs min/median/max per query). 0.0 = no filtering.
+RERANK_MIN_SCORE = float(os.environ.get("RAG_RERANK_MIN_SCORE", "0.0"))
+
+# Score-distribution logging sample rate — log min/median/max of rerank scores
+# once per N queries so you can calibrate RERANK_MIN_SCORE / BOOST_BOTH.
+RERANK_LOG_DISTRIBUTION_EVERY = int(os.environ.get("RAG_RERANK_LOG_DIST_EVERY", "1"))
+
 
 
 # Apply Qdrant/Neo env for processing.* imports (ingest_vectors / ingest_graph)

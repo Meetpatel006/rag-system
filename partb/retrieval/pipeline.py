@@ -78,6 +78,10 @@ from partb.config import (
     PROP_RETRIEVE_LIMIT,
     QDRANT_URL,
     RERANKER_DIR,
+    RERANK_FULL_CHUNK_WORDS,
+    RERANK_LOG_DISTRIBUTION_EVERY,
+    RERANK_MIN_SCORE,
+    RERANK_SEGMENT_TOKENS,
     SECT_RETRIEVE_LIMIT,
 )
 from partb.logger import async_time_it, log_process, logger, time_it
@@ -575,9 +579,8 @@ def rerank_candidates(query: str, candidates: list[dict], top_n: int) -> list[di
         return []
     try:
         ce = get_reranker()
-        scores = ce.predict([(query, c.get("text") or "") for c in candidates])
-        for i, c in enumerate(candidates):
-            c["rerank_score"] = float(scores[i])
+        for c in candidates:
+            c["rerank_score"] = _rerank_score_one(ce, query, c.get("text") or "")
             if c.get("from_qdrant") and c.get("from_neo4j"):
                 c["rerank_score"] += BOOST_BOTH
     except Exception as exc:
@@ -587,6 +590,43 @@ def rerank_candidates(query: str, candidates: list[dict], top_n: int) -> list[di
             c["rerank_score"] = float(base) if isinstance(base, (int, float)) else 0.0
             if c.get("from_qdrant") and c.get("from_neo4j"):
                 c["rerank_score"] += BOOST_BOTH
+
+    # Score-distribution logging (sampled) so RERANK_MIN_SCORE / BOOST_BOTH can
+    # be calibrated against real data rather than guessed.
+    global _rerank_log_counter
+    _rerank_log_counter += 1
+    if RERANK_LOG_DISTRIBUTION_EVERY > 0 and (
+        _rerank_log_counter % RERANK_LOG_DISTRIBUTION_EVERY == 0
+    ):
+        raw = sorted(c.get("rerank_score", 0.0) for c in candidates)
+        if raw:
+            n = len(raw)
+            median = raw[n // 2] if n % 2 else (raw[n // 2 - 1] + raw[n // 2]) / 2
+            boosted = sum(
+                1 for c in candidates if c.get("from_qdrant") and c.get("from_neo4j")
+            )
+            logger.info(
+                "[RERANK] dist | n=%d | min=%.4f | median=%.4f | max=%.4f | "
+                "boosted=%d | top1_score=%.4f | floor=%.4f",
+                n,
+                raw[0],
+                median,
+                raw[-1],
+                boosted,
+                raw[-1],
+                RERANK_MIN_SCORE,
+            )
+
+    # Score floor — drop candidates that scored below the configured minimum.
+    if RERANK_MIN_SCORE > 0:
+        before = len(candidates)
+        candidates = [c for c in candidates if c.get("rerank_score", 0.0) >= RERANK_MIN_SCORE]
+        if before != len(candidates):
+            logger.info(
+                "[RERANK] floor filter | kept %d/%d (dropped %d below %.3f)",
+                len(candidates), before, before - len(candidates), RERANK_MIN_SCORE,
+            )
+
     candidates.sort(key=lambda x: x.get("rerank_score", 0.0), reverse=True)
     return candidates[:top_n]
 
@@ -637,7 +677,7 @@ def load_page_content(book_id: str, page_number: int) -> str | None:
 
 
 @log_process
-def expand_to_pages(top_chunks: list[dict]) -> list[str]:
+def expand_to_pages(top_chunks: list[dict]) -> tuple[list[str], list[dict]]:
     """
     Step 7: Expands top ranked chunks to full page content from metadata.
 
@@ -653,34 +693,58 @@ def expand_to_pages(top_chunks: list[dict]) -> list[str]:
     ranks 3+:
       → not expanded here — handled by fallback chunk text in build_context()
 
-    Returns list of non-empty page content strings in reading order.
-    Falls back gracefully to [] if metadata file not found.
+    Returns:
+        (page_blocks, expansions)
+          page_blocks: list[str] — non-empty page content in reading order.
+          expansions : list[dict] — one entry per fetched page, each:
+              {
+                "book_id":     str,
+                "page":        int,
+                "expanded_from_chunk_id": str,   # which ranked chunk triggered it
+                "rank":        int,              # 1 = rank-1 expansion, 2 = rank-2
+                "relation":    "prev"|"main"|"next"|"single"|"fallback",
+              }
+          This lets retrieve_bundle attribute the expanded content in sources.
+
+    Falls back gracefully to ([], []) if metadata file not found.
     """
     if not top_chunks:
-        return []
+        return [], []
 
     page_blocks: list[str] = []
+    expansions: list[dict] = []
     fetched_pages: set[tuple[str, int]] = set()  # (book_id, page_number) dedup
 
-    def _fetch(book_id: str, page_num: int) -> str | None:
+    def _fetch(book_id: str, page_num: int, src_chunk_id: str, rank: int,
+               relation: str) -> str | None:
         if page_num < 0:
             return None
         key = (book_id, page_num)
         if key in fetched_pages:
             return None  # already included — skip
         fetched_pages.add(key)
-        return load_page_content(book_id, page_num)
+        content = load_page_content(book_id, page_num)
+        if content:
+            expansions.append({
+                "book_id": book_id,
+                "page": page_num,
+                "expanded_from_chunk_id": src_chunk_id,
+                "rank": rank,
+                "relation": relation,
+            })
+        return content
 
     # ── Rank-1: 3-page expansion (N-1, N, N+1) ───────────────────────────────
     rank1 = top_chunks[0]
     bid1 = rank1.get("book_id") or ""
     pr1 = rank1.get("page_range") or [0, 0]
     n1 = int(pr1[0]) if pr1 else 0
+    cid1 = rank1.get("chunk_id") or ""
 
     if bid1 and n1 > 0:
-        prev_content = _fetch(bid1, n1 - 1)  # N-1: intro/heading context
-        main_content = _fetch(bid1, n1)  # N:   primary answer page
-        next_content = _fetch(bid1, n1 + 1)  # N+1: table continuation
+        prev_content = _fetch(bid1, n1 - 1, cid1, 1, "prev")  # N-1
+        main_content = _fetch(bid1, n1, cid1, 1, "main")      # N
+        next_content = _fetch(bid1, n1 + 1, cid1, 1, "next")  # N+1
 
         # Enforce combined character budget
         combined_len = sum(
@@ -706,7 +770,7 @@ def expand_to_pages(top_chunks: list[dict]) -> list[str]:
 
     elif bid1:
         # page_range missing or zero — attempt to fetch page 0 as fallback
-        fallback = _fetch(bid1, n1)
+        fallback = _fetch(bid1, n1, cid1, 1, "fallback")
         if fallback:
             page_blocks.append(fallback)
 
@@ -716,13 +780,14 @@ def expand_to_pages(top_chunks: list[dict]) -> list[str]:
         bid2 = rank2.get("book_id") or ""
         pr2 = rank2.get("page_range") or [0, 0]
         n2 = int(pr2[0]) if pr2 else 0
+        cid2 = rank2.get("chunk_id") or ""
 
         if bid2 and n2 > 0:
-            rank2_content = _fetch(bid2, n2)  # dedup: skips if page already fetched
+            rank2_content = _fetch(bid2, n2, cid2, 2, "single")  # dedup skips if already fetched
             if rank2_content:
                 page_blocks.append(rank2_content)
 
-    return page_blocks
+    return page_blocks, expansions
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -745,6 +810,70 @@ def _sentences(text: str) -> list[str]:
         return [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
 
 
+@time_it
+def _segment_windows(text: str, max_words: int) -> list[str]:
+    """
+    Splits long text into overlapping windows of roughly `max_words` words,
+    aligned on sentence boundaries. Each window starts ~25% into the previous
+    one so a relevant passage straddling a boundary is still scored intact.
+
+    Used to defeat CrossEncoder truncation at rerank time: a long section chunk
+    is scored as the MAX over its windows rather than the (truncated) whole.
+    """
+    text = (text or "").strip()
+    if not text:
+        return []
+    words = text.split()
+    if len(words) <= max_words:
+        return [text]
+    sents = _sentences(text)
+    if not sents:
+        return [text]
+
+    step = max(max_words // 2, 50)  # 50% overlap
+    windows: list[str] = []
+    cur: list[str] = []
+    cur_len = 0
+    for s in sents:
+        sw = len(s.split())
+        if cur and cur_len + sw > max_words:
+            windows.append(" ".join(cur).strip())
+            # keep ~50% overlap: drop sentences until under step size
+            while cur_len > step and len(cur) > 1:
+                cur_len -= len(cur[0].split())
+                cur.pop(0)
+        cur.append(s)
+        cur_len += sw
+    if cur:
+        windows.append(" ".join(cur).strip())
+    return [w for w in windows if w]
+
+
+@time_it
+def _rerank_score_one(ce, query: str, text: str) -> float:
+    """
+    Scores a single (query, chunk) pair, segment-max pooling long chunks.
+
+    The CrossEncoder truncates at ~512 tokens. For chunks longer than
+    RERANK_FULL_CHUNK_WORDS we split into windows and take the max score, so a
+    relevant passage sitting past the truncation point is still found.
+    """
+    text = (text or "").strip()
+    if not text:
+        return 0.0
+    if len(text.split()) <= RERANK_FULL_CHUNK_WORDS:
+        return float(ce.predict([(query, text)])[0])
+    windows = _segment_windows(text, RERANK_SEGMENT_TOKENS)
+    if not windows:
+        return float(ce.predict([(query, text[: RERANK_SEGMENT_TOKENS * 5])])[0])
+    scores = ce.predict([(query, w) for w in windows])
+    return float(max(scores)) if len(scores) else 0.0
+
+
+# Monotonic query counter for sampling score-distribution log output.
+_rerank_log_counter = 0
+
+
 @log_process
 def build_context(
     chunks: list[dict],
@@ -752,7 +881,8 @@ def build_context(
     specs: list[dict],
     max_chars: int,
     page_blocks: list[str] | None = None,
-) -> str:
+    expansions: list[dict] | None = None,
+) -> tuple[str, dict]:
     """
     Builds the LLM context string.
 
@@ -765,19 +895,48 @@ def build_context(
     If page_blocks fills the budget, fallback chunks are skipped entirely.
     If metadata is not available (page_blocks=[]), falls back to original
     all-chunks behaviour — fully backward compatible.
+
+    Returns:
+        (context, usage)
+          context : str — the assembled prompt context.
+          usage   : dict tracking EXACTLY what reached the context:
+              {
+                "used_chunk_ids":   set[str]   — chunk_ids whose text was added,
+                "used_pages":       list[dict] — copy of `expansions` entries whose
+                                                 page content actually made it in
+                                                 (filtered vs page_blocks budget),
+                "specs_included":   bool       — whether the spec block was added,
+                "total_chars":      int        — final context length,
+              }
+        This lets retrieve_bundle build source entries that reflect what the LLM
+        actually saw, instead of every retrieved candidate.
     """
     parts: list[str] = []
     total = 0
+    usage: dict[str, Any] = {
+        "used_chunk_ids": set(),
+        "used_pages": [],
+        "specs_included": False,
+        "total_chars": 0,
+    }
 
     # ── Block 1: Spec nodes ───────────────────────────────────────────────────
     spec_block = format_specs_block(specs)
     if spec_block:
         parts.append(spec_block)
         total += len(spec_block)
+        usage["specs_included"] = True
 
     # ── Block 2+: Full page content (Step 7) ─────────────────────────────────
+    # We zip page_blocks against `expansions` metadata so we know which page
+    # each block came from. page_blocks may contain None / empty strings that
+    # were dropped before zip — filter and align index-by-index.
     if page_blocks:
-        for pb in page_blocks:
+        # Build a parallel list of expansion metadata aligned to page_blocks.
+        # expand_to_pages appends one entry per non-empty fetched page, in the
+        # same order it appends to page_blocks — so the lists are aligned.
+        exp_by_idx = expansions or []
+        for i, pb in enumerate(page_blocks):
             if not pb or not pb.strip():
                 continue
             if total + len(pb) > max_chars:
@@ -788,19 +947,36 @@ def build_context(
                     break
             parts.append(pb)
             total += len(pb)
+            if i < len(exp_by_idx):
+                usage["used_pages"].append(exp_by_idx[i])
             if total >= max_chars:
                 break
 
     if total >= max_chars:
-        return "\n\n---\n\n".join(parts)
+        context = "\n\n---\n\n".join(parts)
+        usage["total_chars"] = len(context)
+        return context, usage
 
     # ── Block N+: Fallback chunk text for ranks 3-8 ───────────────────────────
-    # Skip rank-1 and rank-2 if page blocks were provided for them
+    # Skip rank-1 and rank-2 if page blocks were provided for them — those are
+    # represented in context via the page expansion above.
     fallback_chunks = chunks[2:] if (page_blocks and len(chunks) > 2) else chunks
 
-    # Tables first — never cut off mid-table
-    table_chunks = [c for c in fallback_chunks if c.get("chunk_type") == "table"]
-    text_chunks = [c for c in fallback_chunks if c.get("chunk_type") != "table"]
+    # Tables kept first so partial tables can be skipped atomically, but within
+    # each type we now respect the reranker order (descending rerank_score).
+    # Tables and text are sorted independently so a high-relevance table still
+    # lands before any text chunk (preserving the no-partial-table guarantee),
+    # while irrelevant tables no longer bury a top-ranked text chunk.
+    table_chunks = sorted(
+        [c for c in fallback_chunks if c.get("chunk_type") == "table"],
+        key=lambda x: x.get("rerank_score", 0.0),
+        reverse=True,
+    )
+    text_chunks = sorted(
+        [c for c in fallback_chunks if c.get("chunk_type") != "table"],
+        key=lambda x: x.get("rerank_score", 0.0),
+        reverse=True,
+    )
     ordered = table_chunks + text_chunks
 
     ce = None
@@ -863,10 +1039,13 @@ def build_context(
 
         parts.append(block)
         total += len(block)
+        usage["used_chunk_ids"].add(c.get("chunk_id") or "")
         if total >= max_chars:
             break
 
-    return "\n\n---\n\n".join(parts)
+    context = "\n\n---\n\n".join(parts)
+    usage["total_chars"] = len(context)
+    return context, usage
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -896,19 +1075,42 @@ def retrieve_bundle(query: str, book_ids: list[str], mode: str) -> dict[str, Any
     candidates = merge_candidates(parent_sections, direct_sections, neo4j_section_names)
     top = rerank_candidates(query, candidates, cfg["final_top_n"])
 
-    # Step 7: Page expansion — NEW
-    # expand_to_pages() returns [] gracefully if metadata not found,
+    # Step 7: Page expansion
+    # expand_to_pages() returns ([], []) gracefully if metadata not found,
     # so this is fully backward compatible with books ingested before
     # build_metadata.py was added to the pipeline.
-    page_blocks = expand_to_pages(top)
+    page_blocks, expansions = expand_to_pages(top)
 
-    # Step 8: Build context
-    context = build_context(top, query, specs, cfg["context_max_chars"], page_blocks)
+    # Step 8: Build context — now also returns what actually reached the context.
+    context, usage = build_context(
+        top, query, specs, cfg["context_max_chars"], page_blocks, expansions
+    )
     system_prompt = get_system_prompt(mode)
 
-    sources = [
-        {
-            "chunk_id": c.get("chunk_id"),
+    # ── Sources: reflect what the LLM ACTUALLY saw ────────────────────────────
+    # Map rank-1 / rank-2 chunk -> did its page make it into context? If so, we
+    # attribute that chunk as "represented by its page expansion" even though
+    # its chunk text was skipped by build_context (chunks[2:] / early return).
+    page_expanded_chunk_ids: set[str] = {
+        e["expanded_from_chunk_id"]
+        for e in usage.get("used_pages", [])
+        if e.get("expanded_from_chunk_id")
+    }
+
+    sources: list[dict] = []
+    for c in top:
+        cid = c.get("chunk_id") or ""
+        chunk_text_in = cid in usage.get("used_chunk_ids", set())
+        page_in = cid in page_expanded_chunk_ids
+        if chunk_text_in:
+            included = "chunk"
+        elif page_in:
+            included = "page_expansion"
+        else:
+            included = None  # retrieved but NOT shown to the LLM
+
+        sources.append({
+            "chunk_id": cid,
             "book_id": c.get("book_id"),
             "page_range": c.get("page_range"),
             "section_path": c.get("section_path"),
@@ -916,9 +1118,53 @@ def retrieve_bundle(query: str, book_ids: list[str], mode: str) -> dict[str, Any
             "from_qdrant": c.get("from_qdrant"),
             "from_neo4j": c.get("from_neo4j"),
             "rerank_score": round(c.get("rerank_score", 0.0), 4),
-        }
-        for c in top
-    ]
+            # included_in_context: True only if the LLM actually saw this chunk's
+            # text or its page-expansion content. False = retrieved, then dropped
+            # by the context budget / page-expansion path.
+            "included_in_context": included is not None,
+            "included_via": included,  # "chunk" | "page_expansion" | None
+        })
+
+    # Page-expansion-only entries: pages N-1/N+1 around rank-1 (and the rank-2
+    # page if it wasn't already a chunk source) are real context the LLM saw but
+    # had no source row. Emit them so the UI can show every page that informed
+    # the answer.
+    for e in usage.get("used_pages", []):
+        key = (e["book_id"], e["page"])
+        already = any(
+            (s.get("book_id"), (s.get("page_range") or [0, 0])[0]) == key
+            for s in sources
+        )
+        if already:
+            continue
+        sources.append({
+            "chunk_id": None,
+            "book_id": e["book_id"],
+            "page_range": [e["page"], e["page"]],
+            "section_path": [],
+            "chunk_type": "page_expansion",
+            "from_qdrant": False,
+            "from_neo4j": False,
+            "rerank_score": None,
+            "included_in_context": True,
+            "included_via": "page_expansion",
+            "expanded_from_chunk_id": e.get("expanded_from_chunk_id"),
+            "relation": e.get("relation"),  # prev | main | next | single | fallback
+        })
+
+    # Log a compact source summary for debugging "wrong source" complaints.
+    shown = sum(1 for s in sources if s["included_in_context"])
+    logger.info(
+        "[CONTEXT] top_n=%d | included=%d | dropped=%d | page_expansions=%d | "
+        "specs=%s | ctx_chars=%d/%d",
+        len(top),
+        shown,
+        len(top) - shown,
+        len([s for s in sources if s.get("chunk_type") == "page_expansion"]),
+        usage.get("specs_included", False),
+        usage.get("total_chars", 0),
+        cfg["context_max_chars"],
+    )
 
     return {
         "context": context,
