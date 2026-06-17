@@ -7,13 +7,14 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from parta.logger import logger, worker_log_process
+from logger import logger, worker_log_process, setup_worker_logger
 
 import requests
 from parta.processing.ingest_qdrant import run_qdrant_batch
 
 SERVER_URL = os.environ.get("SERVER_URL", "http://127.0.0.1:8004")
 WORKER_ID = f"qdrant-{uuid.uuid4().hex[:6]}"
+setup_worker_logger("qdrant", WORKER_ID)
 BASE_DIR = Path(__file__).resolve().parent.parent / "parta"
 
 # ── persistent session — reuses TCP connection across all poll cycles ─────────
@@ -155,6 +156,8 @@ while True:
         if is_connected:
             logger.error(f"[{WORKER_ID}] Disconnected from server. Waiting to reconnect...")
             is_connected = False
+        else:
+            logger.error(f"[{WORKER_ID}] Failed to connect to server at {SERVER_URL}. Retrying...")
         time.sleep(5)
 
     except Exception as e:
