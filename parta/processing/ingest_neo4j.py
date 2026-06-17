@@ -115,18 +115,111 @@ GLINER_MAX_CHARS = 500
 MIN_SENTENCE_CHARS = 20
 
 def robust_session_run(session, query, **kwargs):
+    """
+    Runs a Cypher write with deadlock-tolerant retry.
+
+    IMPORTANT: we call .consume() on the result before returning so the
+    implicit transaction fully commits (and releases its locks) before
+    the next query starts. Without .consume(), a returned-but-unconsumed
+    Result keeps the transaction open and holds locks longer than needed.
+
+    Backoff is exponential with jitter — the old 0.5–2.5s fixed delay was
+    too tight under 5-worker concurrent contention, so retries kept
+    re-colliding on the same locks.
+    """
     from neo4j.exceptions import TransientError
     import time
     import random
-    max_retries = 7
+    max_retries = 10
     for attempt in range(max_retries):
         try:
-            return session.run(query, **kwargs)
+            result = session.run(query, **kwargs)
+            result.consume()  # force full commit before lock release
+            return result
         except TransientError as e:
             if attempt == max_retries - 1:
                 raise e
-            logger.warning("[NEO4J] TransientError detected (Deadlock). Retrying attempt %d...", attempt + 1)
-            time.sleep(0.5 + random.random() * 2.0)
+            # Exponential backoff capped at 30s, with ±50% jitter
+            sleep = min(2 ** attempt, 30) * (0.5 + random.random())
+            logger.warning(
+                "[NEO4J] TransientError (deadlock/lock-timeout). "
+                "Retry %d/%d after %.1fs...",
+                attempt + 1, max_retries, sleep,
+            )
+            time.sleep(sleep)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SCHEMA SETUP — uniqueness constraints that make concurrent MERGE safe
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# WITHOUT uniqueness constraints, Neo4j concurrent MERGE takes a broad write
+# lock and re-scans to guarantee uniqueness — this is the documented root
+# cause of deadlocks when multiple workers MERGE the same nodes at once.
+# WITH constraints, MERGE becomes a narrow index lookup that locks a single
+# node deterministically, eliminating cross-worker lock-ordering conflicts.
+#
+# Every constraint here mirrors the exact MERGE anchor pattern used in the
+# write functions below (Entity from BOTH _write_specifications and
+# _write_entity_section_links, which share the {name, book_id} anchor).
+#
+# All statements use IF NOT EXISTS, so concurrent workers / repeated runs
+# no-op safely.  If the DB already contains duplicate nodes that violate a
+# constraint, creation of THAT constraint fails — we log and continue so
+# ingestion doesn't crash, but that constraint stays absent (see warning).
+
+_SCHEMA_CONSTRAINTS = [
+    "CREATE CONSTRAINT book_id IF NOT EXISTS FOR (b:Book) REQUIRE b.id IS UNIQUE",
+    "CREATE CONSTRAINT chapter_name_book IF NOT EXISTS FOR (c:Chapter) REQUIRE (c.name, c.book_id) IS UNIQUE",
+    "CREATE CONSTRAINT section_name_book IF NOT EXISTS FOR (s:Section) REQUIRE (s.name, s.book_id) IS UNIQUE",
+    "CREATE CONSTRAINT subsection_name_book IF NOT EXISTS FOR (ss:Subsection) REQUIRE (ss.name, ss.book_id) IS UNIQUE",
+    "CREATE CONSTRAINT entity_name_book IF NOT EXISTS FOR (e:Entity) REQUIRE (e.name, e.book_id) IS UNIQUE",
+    "CREATE CONSTRAINT spec_subj_unit_book IF NOT EXISTS FOR (sp:Spec) REQUIRE (sp.subject, sp.unit, sp.book_id) IS UNIQUE",
+    "CREATE CONSTRAINT table_id_book IF NOT EXISTS FOR (t:Table) REQUIRE (t.id, t.book_id) IS UNIQUE",
+    "CREATE CONSTRAINT tablerow_id_book IF NOT EXISTS FOR (r:TableRow) REQUIRE (r.id, r.book_id) IS UNIQUE",
+]
+
+# Non-unique index — speeds up the Spec book_id filter used at retrieval time
+_SCHEMA_INDEXES = [
+    "CREATE INDEX spec_book_idx IF NOT EXISTS FOR (sp:Spec) ON (sp.book_id)",
+]
+
+
+def _ensure_schema(session) -> None:
+    """
+    Idempotent schema setup.  Safe to call from every worker on every batch —
+    concurrent CREATE ... IF NOT EXISTS attempts no-op cleanly on Aura.
+
+    If a constraint cannot be created (usually because duplicates already
+    exist in the DB), that constraint is skipped with a warning.  In that
+    case the corresponding MERGEs remain vulnerable to deadlock and a
+    one-time dedup pass against the live DB is recommended.
+    """
+    ok = 0
+    skipped = 0
+    for stmt in _SCHEMA_CONSTRAINTS:
+        try:
+            session.run(stmt).consume()
+            ok += 1
+        except Exception as e:
+            skipped += 1
+            logger.warning(
+                "[NEO4J] Could not create constraint (%s). "
+                "Existing duplicate data may block it. "
+                "Run a dedup pass or this MERGE may still deadlock. Error: %s",
+                stmt.split("REQUIRE")[0].strip(), e,
+            )
+    for stmt in _SCHEMA_INDEXES:
+        try:
+            session.run(stmt).consume()
+            ok += 1
+        except Exception as e:
+            skipped += 1
+            logger.warning("[NEO4J] Could not create index: %s | %s", stmt, e)
+
+    logger.info(
+        "[NEO4J] Schema ready — %d applied, %d skipped", ok, skipped,
+    )
 
 # ─────────────────────────────────────────────────────────────────────────────
 # LAYER 2 — SPECIFICATION REGEX
@@ -485,39 +578,45 @@ def _build_hierarchy(
 # LAYER 2 — SPECIFICATION NODES
 # ─────────────────────────────────────────────────────────────────────────────
 
+_SCHEMA_BATCH_SIZE = 500
+
+
 @time_it
 def _write_specifications(session, specs: List[Dict], section_name: str, book_id: str):
     """
-    Writes Spec nodes and HAS_SPECIFICATION edges for one chunk's specs.
+    Writes Spec nodes + Entity nodes + HAS_SPECIFICATION edges for one chunk.
+
+    BATCHED: previously one transaction per spec (N round-trips + N lock
+    cycles per chunk).  Now all specs for the chunk go in as a single
+    UNWIND batch (chunked at _SCHEMA_BATCH_SIZE for safety), so a chunk
+    with M specs costs ceil(M/500) transactions instead of M.
     """
-    for spec in specs:
-        robust_session_run(session,
-            """
-            MERGE (e:Entity {name: $subject, book_id: $bid})
-            ON CREATE SET e.type = 'equipment', e.source = 'spec_regex'
+    if not specs:
+        return
 
-            MERGE (sp:Spec {
-                subject: $subject,
-                unit:    $unit,
-                book_id: $bid
-            })
-            ON CREATE SET
-                sp.value    = $value,
-                sp.raw      = $raw,
-                sp.section  = $section
-            ON MATCH SET
-                sp.value    = $value,
-                sp.raw      = $raw
+    rows = [
+        {
+            "subject": s["subject"].lower(),
+            "value":   s["value"],
+            "unit":    s["unit"],
+            "raw":     s["raw"],
+            "section": section_name,
+        }
+        for s in specs
+    ]
 
-            MERGE (e)-[:HAS_SPECIFICATION]->(sp)
-            """,
-            bid=book_id,
-            subject=spec["subject"].lower(),
-            value=spec["value"],
-            unit=spec["unit"],
-            raw=spec["raw"],
-            section=section_name,
-        )
+    cypher = """
+    UNWIND $batch AS row
+    MERGE (e:Entity {name: row.subject, book_id: $bid})
+      ON CREATE SET e.type = 'equipment', e.source = 'spec_regex'
+    MERGE (sp:Spec {subject: row.subject, unit: row.unit, book_id: $bid})
+      ON CREATE SET sp.value = row.value, sp.raw = row.raw, sp.section = row.section
+      ON MATCH   SET sp.value = row.value, sp.raw = row.raw
+    MERGE (e)-[:HAS_SPECIFICATION]->(sp)
+    """
+
+    for i in range(0, len(rows), _SCHEMA_BATCH_SIZE):
+        robust_session_run(session, cypher, bid=book_id, batch=rows[i:i + _SCHEMA_BATCH_SIZE])
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -534,30 +633,45 @@ def _write_entity_section_links(
     """
     Writes Entity nodes and MENTIONED_IN edges for one chunk.
     Operates at section level — far more meaningful than page level.
-    """
-    for ent in entities:
-        # Try to match section or subsection
-        robust_session_run(session,
-            """
-            MERGE (e:Entity {name: $name, book_id: $bid})
-            ON CREATE SET e.type = $etype, e.raw = $raw
-            ON MATCH  SET
-                e.type = COALESCE(e.type, $etype),
-                e.raw  = COALESCE(e.raw,  $raw)
 
-            WITH e
-            OPTIONAL MATCH (s:Section {name: $sname, book_id: $bid})
-            OPTIONAL MATCH (ss:Subsection {name: $sname, book_id: $bid})
-            WITH e,
-                 COALESCE(s, ss) AS section_node
-            WHERE section_node IS NOT NULL
-            MERGE (e)-[:MENTIONED_IN]->(section_node)
-            """,
+    BATCHED: previously one transaction per entity.  Now all entities for
+    the chunk are written in a single UNWIND transaction (chunked at
+    _SCHEMA_BATCH_SIZE).  Shares the {name, book_id} anchor with
+    _write_specifications — both are covered by the entity_name_book
+    uniqueness constraint.
+    """
+    if not entities:
+        return
+
+    rows = [
+        {
+            "name":  ent["name"],
+            "etype": ent["type"],
+            "raw":   ent.get("raw", ent["name"]),
+        }
+        for ent in entities
+    ]
+
+    cypher = """
+    UNWIND $batch AS row
+    MERGE (e:Entity {name: row.name, book_id: $bid})
+      ON CREATE SET e.type = row.etype, e.raw = row.raw
+      ON MATCH   SET e.type = COALESCE(e.type, row.etype),
+                     e.raw  = COALESCE(e.raw,  row.raw)
+    WITH e
+    OPTIONAL MATCH (s:Section {name: $sname, book_id: $bid})
+    OPTIONAL MATCH (ss:Subsection {name: $sname, book_id: $bid})
+    WITH e, COALESCE(s, ss) AS section_node
+    WHERE section_node IS NOT NULL
+    MERGE (e)-[:MENTIONED_IN]->(section_node)
+    """
+
+    for i in range(0, len(rows), _SCHEMA_BATCH_SIZE):
+        robust_session_run(
+            session, cypher,
             bid=book_id,
-            name=ent["name"],
-            etype=ent["type"],
-            raw=ent.get("raw", ent["name"]),
             sname=section_name,
+            batch=rows[i:i + _SCHEMA_BATCH_SIZE],
         )
 
 
@@ -677,12 +791,9 @@ def _write_table_nodes(
         psname=parent_section,
     )
 
-    # MERGE TableRow nodes
+    # MERGE TableRow nodes — batched UNWIND (previously one tx per row)
+    row_dicts = []
     for row_idx, row in enumerate(rows):
-        row_id = f"{table_id}_row_{row_idx}"
-
-        # Build row properties — all header values stored flat
-        # Also pick out parameter/value/unit for the most common pattern
         lowered = {k.lower().strip(): v for k, v in row.items()}
         param = (
             lowered.get("parameter") or
@@ -698,30 +809,36 @@ def _write_table_nodes(
             ""
         )
         unit = lowered.get("unit") or lowered.get("units") or ""
+        row_dicts.append({
+            "rid":  f"{table_id}_row_{row_idx}",
+            "param": str(param),
+            "value": str(value),
+            "unit":  str(unit),
+            "raw":   json.dumps(row),
+            "ridx":  row_idx,
+        })
 
-        robust_session_run(session,
-            """
-            MERGE (r:TableRow {id: $rid, book_id: $bid})
-            ON CREATE SET
-                r.parameter  = $param,
-                r.value      = $value,
-                r.unit       = $unit,
-                r.row_data   = $raw_row,
-                r.row_index  = $ridx
-
-            WITH r
-            MATCH (t:Table {id: $tid, book_id: $bid})
-            MERGE (t)-[:HAS_ROW]->(r)
-            """,
-            bid=book_id,
-            rid=row_id,
-            tid=table_id,
-            param=str(param),
-            value=str(value),
-            unit=str(unit),
-            raw_row=json.dumps(row),
-            ridx=row_idx,
-        )
+    if row_dicts:
+        row_cypher = """
+        UNWIND $rows AS row
+        MERGE (r:TableRow {id: row.rid, book_id: $bid})
+        ON CREATE SET
+            r.parameter = row.param,
+            r.value     = row.value,
+            r.unit      = row.unit,
+            r.row_data  = row.raw,
+            r.row_index = row.ridx
+        WITH r
+        MATCH (t:Table {id: $tid, book_id: $bid})
+        MERGE (t)-[:HAS_ROW]->(r)
+        """
+        for i in range(0, len(row_dicts), _SCHEMA_BATCH_SIZE):
+            robust_session_run(
+                session, row_cypher,
+                bid=book_id,
+                tid=table_id,
+                rows=row_dicts[i:i + _SCHEMA_BATCH_SIZE],
+            )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -873,7 +990,13 @@ def run_neo4j_ingestion(
     logger.info("[NEO4J] Starting graph ingestion | book=%s | ready_path=%s", book_id, ready_path)
     print(f"\n[NEO4J] Connecting to {NEO4J_URI}...")
     try:
-        driver = GraphDatabase.driver(NEO4J_URI, auth=NEO4J_AUTH, max_connection_lifetime=200, keep_alive=True)
+        driver = GraphDatabase.driver(
+            NEO4J_URI,
+            auth=NEO4J_AUTH,
+            max_connection_lifetime=3600,         # 1h — was 200ms (recycled connections mid-tx, leaking locks)
+            connection_acquisition_timeout=120,   # fail fast instead of blocking forever under load
+            max_connection_pool_size=100,
+        )
         driver.verify_connectivity()
         print("[NEO4J] ✅ Neo4j connected.")
         logger.info("[NEO4J] Neo4j connected | uri=%s", NEO4J_URI)
@@ -914,6 +1037,7 @@ def run_neo4j_ingestion(
 
     # ── All writes in one session ─────────────────────────────────────────────
     with driver.session() as session:
+        _ensure_schema(session)
 
         # Layer 1 — Document Hierarchy
         if progress_callback:
@@ -1028,7 +1152,13 @@ def run_neo4j_batch(
     # ── Connect to Neo4j ──────────────────────────────────────────────────────
     logger.info("[NEO4J-BATCH] Connecting to %s ...", NEO4J_URI)
     try:
-        driver = GraphDatabase.driver(NEO4J_URI, auth=NEO4J_AUTH, max_connection_lifetime=200, keep_alive=True)
+        driver = GraphDatabase.driver(
+            NEO4J_URI,
+            auth=NEO4J_AUTH,
+            max_connection_lifetime=3600,         # 1h — was 200ms (recycled connections mid-tx, leaking locks)
+            connection_acquisition_timeout=120,   # fail fast instead of blocking forever under load
+            max_connection_pool_size=100,
+        )
         driver.verify_connectivity()
         logger.info("[NEO4J-BATCH] ✅ Neo4j connected.")
     except Exception as e:
@@ -1060,6 +1190,7 @@ def run_neo4j_batch(
     t_start = time.perf_counter()
 
     with driver.session() as session:
+        _ensure_schema(session)
         # Layer 1 — hierarchy (MERGE = idempotent, safe from all workers)
         _build_hierarchy(session, chunks, book_id, book_title)
 
