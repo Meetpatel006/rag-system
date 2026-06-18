@@ -21,12 +21,65 @@ BASE_DIR   = Path(__file__).resolve().parent.parent / "parta"
 # ── persistent session — reuses TCP connection across all poll cycles ─────────
 _session = requests.Session()
 
+# ── local result cache — survives NAS disconnect ──────────────────────────────
+RESULT_CACHE_DIR = Path(tempfile.gettempdir()) / "worker_result_cache" / "neo4j"
+RESULT_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _cache_result(job_id: str, payload: dict):
+    path = RESULT_CACHE_DIR / f"{job_id}.json"
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False)
+
+
+def _clear_cached_result(job_id: str):
+    (RESULT_CACHE_DIR / f"{job_id}.json").unlink(missing_ok=True)
+
+
+def _submit_with_retry(endpoint: str, payload: dict):
+    delay = 5
+    while True:
+        try:
+            r = _session.post(endpoint, json=payload, timeout=30)
+            if r.status_code == 200:
+                return
+            logger.warning(f"[{WORKER_ID}] Submit returned HTTP {r.status_code}, retrying in {delay}s...")
+        except requests.exceptions.ConnectionError:
+            logger.warning(f"[{WORKER_ID}] Connection error on submit, retrying in {delay}s...")
+        time.sleep(delay)
+        delay = min(delay * 2, 60)
+
+
+def _replay_cached_results():
+    cached = sorted(RESULT_CACHE_DIR.glob("*.json"))
+    if not cached:
+        return
+    logger.info(f"[{WORKER_ID}] Replaying {len(cached)} cached result(s)...")
+    for cache_file in cached:
+        try:
+            with open(cache_file, encoding="utf-8") as f:
+                payload = json.load(f)
+            r = _session.post(f"{SERVER_URL}/submit_neo4j_result", json=payload, timeout=30)
+            if r.status_code == 200:
+                cache_file.unlink()
+                logger.info(f"[{WORKER_ID}] Replayed and cleared: {cache_file.name}")
+            else:
+                logger.warning(f"[{WORKER_ID}] Replay failed HTTP {r.status_code}: {cache_file.name}")
+        except Exception as e:
+            logger.warning(f"[{WORKER_ID}] Replay error for {cache_file.name}: {e}")
+
+
 logger.info("=" * 80)
 logger.info(f"[{WORKER_ID}] NEO4J WORKER STARTED (batch mode)")
-logger.info(f"[{WORKER_ID}] SERVER   : {SERVER_URL}")
-logger.info(f"[{WORKER_ID}] BASE_DIR : {BASE_DIR}")
+logger.info(f"[{WORKER_ID}] SERVER      : {SERVER_URL}")
+logger.info(f"[{WORKER_ID}] BASE_DIR    : {BASE_DIR}")
+logger.info(f"[{WORKER_ID}] CACHE_DIR   : {RESULT_CACHE_DIR}")
 logger.info("=" * 80)
 is_connected = False
+
+
+# ── replay any results cached from a previous run before polling ──────────────
+_replay_cached_results()
 
 @worker_log_process(WORKER_ID)
 def execute_neo4j_batch(book_id, ready_path, batch_start, batch_count):
@@ -37,9 +90,6 @@ def execute_neo4j_batch(book_id, ready_path, batch_start, batch_count):
         batch_start=batch_start,
         batch_count=batch_count,
     )
-
-wait_count = 0
-MAX_WAITS = 15
 
 while True:
     job_id  = None
@@ -64,14 +114,8 @@ while True:
 
         job = r.json()
         if job.get("action") != "PROCESS":
-            wait_count += 1
-            if wait_count >= MAX_WAITS:
-                logger.info(f"[{WORKER_ID}] No jobs received for {MAX_WAITS * 2}s. Exiting gracefully.")
-                break
             time.sleep(2)
             continue
-        
-        wait_count = 0
 
         job_id       = job.get("job_id")
         book_id      = job.get("book_id")
@@ -110,22 +154,17 @@ while True:
         
         logger.info(f"[{WORKER_ID}] Neo4j batch completed — entities={result.get('entities_written', 0)}, specs={result.get('specs_written', 0)}")
 
-        # ── submit success ─────────────────────────────────────────────────────
-        response = _session.post(
-            f"{SERVER_URL}/submit_neo4j_result",
-            json={
-                "job_id":    job_id,
-                "worker_id": WORKER_ID,
-                "success":   True,
-                "content":   result,
-            },
-            timeout=1800,
-        )
-
-        if response.status_code == 200:
-            logger.info(f"[{WORKER_ID}] Completion acknowledged for batch #{batch_idx} of '{book_id}'")
-        else:
-            logger.error(f"[{WORKER_ID}] submit_neo4j_result failed: HTTP {response.status_code}")
+        # ── build payload, cache locally before attempting submit ─────────────
+        payload = {
+            "job_id":    job_id,
+            "worker_id": WORKER_ID,
+            "success":   True,
+            "content":   result,
+        }
+        _cache_result(job_id, payload)
+        _submit_with_retry(f"{SERVER_URL}/submit_neo4j_result", payload)
+        _clear_cached_result(job_id)
+        logger.info(f"[{WORKER_ID}] Completion acknowledged for batch #{batch_idx} of '{book_id}'")
 
         logger.info("=" * 80)
 
@@ -151,10 +190,10 @@ while True:
                         "success":   False,
                         "content":   "",
                     },
-                    timeout=1800,
+                    timeout=30,
                 )
-            except Exception as e:
-                logger.error(f"[{WORKER_ID}] Error submitting failure: {e}")
+            except Exception as e2:
+                logger.error(f"[{WORKER_ID}] Error submitting failure: {e2}")
                 logger.error(traceback.format_exc())
 
         time.sleep(5)

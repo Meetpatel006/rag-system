@@ -1,4 +1,5 @@
 import os
+import json
 import tempfile
 import time
 import traceback
@@ -20,12 +21,65 @@ BASE_DIR = Path(__file__).resolve().parent.parent / "parta"
 # ── persistent session — reuses TCP connection across all poll cycles ─────────
 _session = requests.Session()
 
+# ── local result cache — survives NAS disconnect ──────────────────────────────
+RESULT_CACHE_DIR = Path(tempfile.gettempdir()) / "worker_result_cache" / "qdrant"
+RESULT_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _cache_result(job_id: str, payload: dict):
+    path = RESULT_CACHE_DIR / f"{job_id}.json"
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False)
+
+
+def _clear_cached_result(job_id: str):
+    (RESULT_CACHE_DIR / f"{job_id}.json").unlink(missing_ok=True)
+
+
+def _submit_with_retry(endpoint: str, payload: dict):
+    delay = 5
+    while True:
+        try:
+            r = _session.post(endpoint, json=payload, timeout=30)
+            if r.status_code == 200:
+                return
+            logger.warning(f"[{WORKER_ID}] Submit returned HTTP {r.status_code}, retrying in {delay}s...")
+        except requests.exceptions.ConnectionError:
+            logger.warning(f"[{WORKER_ID}] Connection error on submit, retrying in {delay}s...")
+        time.sleep(delay)
+        delay = min(delay * 2, 60)
+
+
+def _replay_cached_results():
+    cached = sorted(RESULT_CACHE_DIR.glob("*.json"))
+    if not cached:
+        return
+    logger.info(f"[{WORKER_ID}] Replaying {len(cached)} cached result(s)...")
+    for cache_file in cached:
+        try:
+            with open(cache_file, encoding="utf-8") as f:
+                payload = json.load(f)
+            r = _session.post(f"{SERVER_URL}/submit_qdrant_result", json=payload, timeout=30)
+            if r.status_code == 200:
+                cache_file.unlink()
+                logger.info(f"[{WORKER_ID}] Replayed and cleared: {cache_file.name}")
+            else:
+                logger.warning(f"[{WORKER_ID}] Replay failed HTTP {r.status_code}: {cache_file.name}")
+        except Exception as e:
+            logger.warning(f"[{WORKER_ID}] Replay error for {cache_file.name}: {e}")
+
+
 logger.info("=" * 80)
 logger.info(f"[{WORKER_ID}] QDRANT WORKER STARTED (batch mode)")
-logger.info(f"[{WORKER_ID}] SERVER   : {SERVER_URL}")
-logger.info(f"[{WORKER_ID}] BASE_DIR : {BASE_DIR}")
+logger.info(f"[{WORKER_ID}] SERVER      : {SERVER_URL}")
+logger.info(f"[{WORKER_ID}] BASE_DIR    : {BASE_DIR}")
+logger.info(f"[{WORKER_ID}] CACHE_DIR   : {RESULT_CACHE_DIR}")
 logger.info("=" * 80)
 is_connected = False
+
+
+# ── replay any results cached from a previous run before polling ──────────────
+_replay_cached_results()
 
 @worker_log_process(WORKER_ID)
 def execute_qdrant_batch(book_id, ready_path, prop_path, batch_start, batch_count, batch_kind):
@@ -38,9 +92,6 @@ def execute_qdrant_batch(book_id, ready_path, prop_path, batch_start, batch_coun
         batch_count=batch_count,
         batch_kind=batch_kind,
     )
-
-wait_count = 0
-MAX_WAITS = 15
 
 while True:
     job_id = None
@@ -66,14 +117,8 @@ while True:
         job = r.json()
 
         if job.get("action") != "PROCESS":
-            wait_count += 1
-            if wait_count >= MAX_WAITS:
-                logger.info(f"[{WORKER_ID}] No jobs received for {MAX_WAITS * 2}s. Exiting gracefully.")
-                break
             time.sleep(2)
             continue
-
-        wait_count = 0
 
         job_id       = job["job_id"]
         book_id      = job["book_id"]
@@ -133,24 +178,22 @@ while True:
             book_id, local_ready_path, local_prop_path, batch_start, batch_count, batch_kind
         )
 
-        # ── submit success ─────────────────────────────────────────────────────
-        response = _session.post(
-            f"{SERVER_URL}/submit_qdrant_result",
-            json={
-                "job_id": job_id,
-                "worker_id": WORKER_ID,
-                "success": True,
-                "content": {
-                    "chunks_stored": chunks_stored,
-                    "batch_kind": batch_kind,
-                    "batch_start": batch_start,
-                    "batch_count": batch_count,
-                }
-            },
-            timeout=1800,
-        )
-
-        logger.info(f"[{WORKER_ID}] Completed batch #{batch_idx} ({batch_kind}) status={response.status_code}")
+        # ── build payload, cache locally before attempting submit ─────────────
+        payload = {
+            "job_id": job_id,
+            "worker_id": WORKER_ID,
+            "success": True,
+            "content": {
+                "chunks_stored": chunks_stored,
+                "batch_kind": batch_kind,
+                "batch_start": batch_start,
+                "batch_count": batch_count,
+            }
+        }
+        _cache_result(job_id, payload)
+        _submit_with_retry(f"{SERVER_URL}/submit_qdrant_result", payload)
+        _clear_cached_result(job_id)
+        logger.info(f"[{WORKER_ID}] Completion acknowledged for batch #{batch_idx} ({batch_kind})")
 
     except requests.exceptions.ConnectionError:
         if is_connected:
@@ -174,7 +217,7 @@ while True:
                         "success": False,
                         "error": str(e),
                     },
-                    timeout=1800,
+                    timeout=30,
                 )
             except Exception:
                 pass

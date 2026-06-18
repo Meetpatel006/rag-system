@@ -17,6 +17,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import json
 import time
 import uuid
 from typing import List, Tuple
@@ -41,8 +42,11 @@ except ImportError:
 try:
     from docling.document_converter import DocumentConverter
     HAS_DOCLING = True
+    # ponytail: lazy singleton, one converter per process
+    _docling_converter = None
 except ImportError:
     HAS_DOCLING = False
+    _docling_converter = None
 
 from logger import logger, worker_log_process, setup_worker_logger
 
@@ -214,6 +218,14 @@ def _extract_page_text(page) -> str:
     return _extract_two_column_text(blocks, page_width, page_height)
 
 
+def _get_docling_converter():
+    """Lazy singleton: create DocumentConverter once per process."""
+    global _docling_converter
+    if _docling_converter is None:
+        _docling_converter = DocumentConverter()
+    return _docling_converter
+
+
 def _extract_with_docling(pdf_bytes: bytes, start_offset: int) -> str:
     """
     Extract text from a PDF chunk using Docling.
@@ -224,7 +236,7 @@ def _extract_with_docling(pdf_bytes: bytes, start_offset: int) -> str:
             "Docling is not installed. Run: pip install docling"
         )
 
-    converter = DocumentConverter()
+    converter = _get_docling_converter()
     result = converter.convert(pdf_bytes)
     md_text = result.document.export_to_markdown()
 
@@ -262,18 +274,68 @@ def process_chunk(pdf_bytes: bytes, start_offset: int, ocr_enabled: bool = False
 
 
 _session = requests.Session()
+
+# ── local result cache — survives NAS disconnect ──────────────────────────────
+RESULT_CACHE_DIR = Path(tempfile.gettempdir()) / "worker_result_cache" / "text"
+RESULT_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _cache_result(job_id: str, payload: dict):
+    path = RESULT_CACHE_DIR / f"{job_id}.json"
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False)
+
+
+def _clear_cached_result(job_id: str):
+    (RESULT_CACHE_DIR / f"{job_id}.json").unlink(missing_ok=True)
+
+
+def _submit_with_retry(endpoint: str, payload: dict):
+    delay = 5
+    while True:
+        try:
+            r = _session.post(endpoint, json=payload, timeout=30)
+            if r.status_code == 200:
+                return
+            logger.warning(f"[{WORKER_ID}] Submit returned HTTP {r.status_code}, retrying in {delay}s...")
+        except requests.exceptions.ConnectionError:
+            logger.warning(f"[{WORKER_ID}] Connection error on submit, retrying in {delay}s...")
+        time.sleep(delay)
+        delay = min(delay * 2, 60)
+
+
+def _replay_cached_results():
+    cached = sorted(RESULT_CACHE_DIR.glob("*.json"))
+    if not cached:
+        return
+    logger.info(f"[{WORKER_ID}] Replaying {len(cached)} cached result(s)...")
+    for cache_file in cached:
+        try:
+            with open(cache_file, encoding="utf-8") as f:
+                payload = json.load(f)
+            r = _session.post(f"{SERVER_URL}/submit_result", json=payload, timeout=30)
+            if r.status_code == 200:
+                cache_file.unlink()
+                logger.info(f"[{WORKER_ID}] Replayed and cleared: {cache_file.name}")
+            else:
+                logger.warning(f"[{WORKER_ID}] Replay failed HTTP {r.status_code}: {cache_file.name}")
+        except Exception as e:
+            logger.warning(f"[{WORKER_ID}] Replay error for {cache_file.name}: {e}")
+
+
 is_connected = False
 
 def start_worker():
     global is_connected
     logger.info("=" * 80)
     logger.info(f"[{WORKER_ID}] TEXT WORKER STARTED (extraction mode)")
-    logger.info(f"[{WORKER_ID}] SERVER   : {SERVER_URL}")
-    logger.info(f"[{WORKER_ID}] BASE_DIR : {Path(__file__).resolve().parent.parent}")
+    logger.info(f"[{WORKER_ID}] SERVER      : {SERVER_URL}")
+    logger.info(f"[{WORKER_ID}] BASE_DIR    : {Path(__file__).resolve().parent.parent}")
+    logger.info(f"[{WORKER_ID}] CACHE_DIR   : {RESULT_CACHE_DIR}")
     logger.info("=" * 80)
 
-    wait_count = 0
-    MAX_WAITS = 15
+    # ── replay any results cached from a previous run before polling ──────────
+    _replay_cached_results()
 
     while True:
         try:
@@ -295,15 +357,10 @@ def start_worker():
             action = data.get("action")
 
             if action == "WAIT":
-                wait_count += 1
-                if wait_count >= MAX_WAITS:
-                    logger.info(f"[{WORKER_ID}] No jobs received for {MAX_WAITS * WAIT_SLEEP}s. Exiting gracefully.")
-                    break
                 time.sleep(WAIT_SLEEP)
                 continue
 
             if action == "PROCESS":
-                wait_count = 0
                 job_id = data["job_id"]
                 book_id = data["book_id"]
                 chunk_idx = data["chunk_idx"]
@@ -328,21 +385,17 @@ def start_worker():
                             f"[{WORKER_ID}] Extraction success for chunk {chunk_idx}. Submitting."
                         )
 
-                        for attempt in range(5):
-                            submit_resp = _session.post(
-                                f"{SERVER_URL}/submit_result",
-                                json={
-                                    "job_id": job_id,
-                                    "worker_id": WORKER_ID,
-                                    "success": True,
-                                    "content": content,
-                                },
-                                timeout=REQUEST_TIMEOUT,
-                            )
-                            if submit_resp.status_code == 200:
-                                break
-                            logger.warning(f"[{WORKER_ID}] Submit failed with {submit_resp.status_code}. Retrying...")
-                            time.sleep(2)
+                        # ── build payload, cache locally before attempting submit ──
+                        payload = {
+                            "job_id": job_id,
+                            "worker_id": WORKER_ID,
+                            "success": True,
+                            "content": content,
+                        }
+                        _cache_result(job_id, payload)
+                        _submit_with_retry(f"{SERVER_URL}/submit_result", payload)
+                        _clear_cached_result(job_id)
+                        logger.info(f"[{WORKER_ID}] Completion acknowledged for chunk {chunk_idx}")
 
                     except Exception as e:
                         logger.error(
