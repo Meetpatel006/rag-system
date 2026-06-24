@@ -413,7 +413,8 @@ def run_phase1(job: dict, jobs_col) -> tuple:
             stage="Text Extraction",
             message="Starting distributed extraction...",
         )
-        run_extraction(book_id, pdf_path, str(BASE_DIR), callback)
+        ocr_enabled = job.get("ocr_enabled", False)
+        run_extraction(book_id, pdf_path, str(BASE_DIR), callback, ocr_enabled=ocr_enabled)
 
         from processing.chunk import run_chunking
 

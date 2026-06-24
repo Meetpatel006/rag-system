@@ -277,6 +277,7 @@ def check_book_id(book_id: str, user=Depends(verify_token)):
 async def upload_book(
     book_id: str = Form(...),
     file: UploadFile = File(...),
+    ocr_enabled: bool = Form(False),
     user: dict = Depends(verify_token),
 ):
     if not re.match(r"^[A-Za-z0-9_\-]+$", book_id):
@@ -313,6 +314,7 @@ async def upload_book(
         "stage": "Queued",
         "message": f"Position {queue_position} in queue",
         "queue_position": queue_position,
+        "ocr_enabled": ocr_enabled,
         # Checkpoint paths — written by Phase 1 before Phase 2 starts
         "ready_path": None,
         "prop_path": None,
@@ -332,6 +334,7 @@ async def upload_book(
             "book_id": book_id,
             "pdf_path": str(pdf_path),
             "user_id": user["user_id"],
+            "ocr_enabled": ocr_enabled,
         }
     )
 
