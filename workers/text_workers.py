@@ -243,9 +243,31 @@ def _get_converter(ocr: bool = False):
         return _docling_ocr_converter
 
 
+import fitz
+
+def _has_images(pdf_bytes: bytes) -> bool:
+    try:
+        doc = fitz.open("pdf", pdf_bytes)
+        for page in doc:
+            if page.get_images():
+                return True
+        return False
+    except Exception as e:
+        logger.warning(f"[{WORKER_ID}] PyMuPDF image check failed, defaulting to OCR: {e}")
+        return True
+
+
 @worker_log_process(WORKER_ID)
 def process_chunk(pdf_bytes: bytes, start_offset: int, ocr_enabled: bool = False) -> str:
-    converter = _get_converter(ocr=ocr_enabled)
+    actual_ocr = False
+    if ocr_enabled:
+        if _has_images(pdf_bytes):
+            actual_ocr = True
+            logger.info(f"[{WORKER_ID}] Chunk {start_offset} contains images. Using OCR converter.")
+        else:
+            logger.info(f"[{WORKER_ID}] Chunk {start_offset} is pure text (0 images). Bypassing OCR for speed.")
+
+    converter = _get_converter(ocr=actual_ocr)
 
     tmp_path = Path(tempfile.gettempdir()) / f"docling_{uuid.uuid4().hex}_{start_offset}.pdf"
     try:

@@ -11,3 +11,4 @@ temp_extract*
 .*whl
 *.tar.gz
 .*zip
+workers/logs/text/
