@@ -1,54 +1,44 @@
 """
 text_workers.py
-Fixed version: model-load lock contention fix, shared model cache preserved,
-failure reporting and connection-state logging restored, Windows file-lock
-(WinError 32) hardened across every disk touch point.
+Fixed version:
+- Local-disk model cache per machine (kills NAS/SMB file-lock contention
+  that was producing WinError 32 and inconsistent transformers errors)
+- Async delete queue for temp PDFs (unlink retries no longer block the job loop)
+- Loud accelerate dependency check at startup
+- Result cache + replay preserved, moved off system temp to LOCALAPPDATA
+- Win-safe file ops preserved
 """
 
 import sys
 import os
 import gc
 import json
+import queue
+import shutil
 import tempfile
 import time
 import uuid
 import random
 import threading
 from pathlib import Path
-from typing import List
 
 from logger import logger, worker_log_process, setup_worker_logger
 import requests
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-# ─────────────────────────────────────────────────────────────
-# Model artifacts stay on the SHARED path. Do NOT give each worker
-# its own HF_HOME / TRANSFORMERS_CACHE — that forces every worker to
-# independently download/cache its own copy of the model, multiplying
-# disk + NAS I/O instead of fixing contention.
-# ─────────────────────────────────────────────────────────────
 BASE_DIR = Path(__file__).resolve().parent.parent
-
-os.environ.setdefault(
-    "DOCLING_ARTIFACTS_PATH",
-    str(BASE_DIR / "parta" / "portable" / "docling"),
-)
-# Stop huggingface_hub / transformers from doing remote lock-file checks
-# against the shared cache on every cold start — this is the actual fix
-# for "all workers stall waiting on the same lock file."
-os.environ.setdefault("HF_HUB_OFFLINE", "1")
-os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
-
-from docling.document_converter import DocumentConverter, PdfFormatOption
-from docling.datamodel.pipeline_options import PdfPipelineOptions, EasyOcrOptions
-from docling.datamodel.base_models import InputFormat
-
-
-SERVER_URL = os.environ.get("SERVER_URL", "http://127.0.0.1:8004")
 WORKER_ID = f"text-{uuid.uuid4().hex[:6]}"
 
 setup_worker_logger("text", WORKER_ID)
+
+# accelerate is a hard dependency for Docling's transformer-backed layout
+# model when it loads with device_map. Missing it doesn't crash on import,
+# it crashes mid-job with a confusing "device_map / tp_plan / torch.device
+# context manager" error. Catch it loud at startup instead of mid-job.
+import accelerate  # noqa: F401
+
+SERVER_URL = os.environ.get("SERVER_URL", "http://127.0.0.1:8004")
 
 REQUEST_TIMEOUT = 30
 WAIT_SLEEP = 2
@@ -57,10 +47,6 @@ ERROR_SLEEP = 5
 
 # ─────────────────────────────────────────────────────────────
 # Windows-safe file ops — retry with backoff on transient locks.
-# WinError 32 ("file in use by another process") happens when a
-# library (Docling/PyPdfium backend, antivirus, indexer, or our own
-# trailing handle) hasn't released a handle yet. POSIX never hits
-# this because multiple open handles to one inode are allowed there.
 # ─────────────────────────────────────────────────────────────
 def _win_safe_unlink(path: Path, attempts: int = 8, base_delay: float = 0.15):
     for i in range(attempts):
@@ -108,12 +94,109 @@ def _win_safe_read_text(path: Path, attempts: int = 5, base_delay: float = 0.15)
 
 
 # ─────────────────────────────────────────────────────────────
-# Model-init lock — this is what actually prevents concurrent
-# model-load races WITHIN one process (multiple threads).
-# NOTE: if your 5 workers are 5 separate `python text_workers.py`
-# processes (not threads in one process), this lock does nothing
-# across processes — each process gets its own lock object. Confirm
-# how you're launching workers before relying on this alone.
+# Async delete queue. _win_safe_unlink retries for up to ~38s on a
+# stubborn lock (8 attempts, exponential backoff). Doing that
+# synchronously inside process_chunk blocks the job loop — one
+# locked temp file stalls that worker for the entire retry window.
+# Deletes now happen on a background thread instead.
+# ─────────────────────────────────────────────────────────────
+_delete_queue: "queue.Queue[Path]" = queue.Queue()
+
+
+def _reaper_loop():
+    while True:
+        path = _delete_queue.get()
+        _win_safe_unlink(path)
+
+
+threading.Thread(target=_reaper_loop, daemon=True, name="tmp-reaper").start()
+
+
+def _queue_delete(path: Path):
+    _delete_queue.put(path)
+
+
+# ─────────────────────────────────────────────────────────────
+# Model sync: NAS -> local disk, once per machine.
+#
+# This is the actual fix for the WinError 32 / weird transformers
+# errors. SMB does not give the same locking guarantees as NTFS.
+# Five machines independently reading the same model directory over
+# the network is the root cause, not a Docling bug. Each worker now
+# gets its own local copy and never touches the NAS for model files
+# again after the first sync.
+# ─────────────────────────────────────────────────────────────
+NAS_DOCLING_DIR = BASE_DIR / "parta" / "portable" / "docling"
+LOCAL_CACHE_ROOT = Path(os.environ.get("LOCALAPPDATA", tempfile.gettempdir())) / "docling_worker_cache"
+
+
+def _dir_signature(path: Path) -> str:
+    """File count + total size + newest mtime. Cheap, not cryptographic,
+    good enough to detect 'the NAS copy changed since last sync'."""
+    if not path.exists():
+        return "missing"
+    count = 0
+    total_size = 0
+    newest = 0.0
+    for f in path.rglob("*"):
+        if f.is_file():
+            st = f.stat()
+            count += 1
+            total_size += st.st_size
+            newest = max(newest, st.st_mtime)
+    return f"{count}-{total_size}-{int(newest)}"
+
+
+def _sync_models_locally(nas_source: Path, local_dest: Path) -> Path:
+    marker = local_dest / ".sync_signature"
+    nas_sig = _dir_signature(nas_source)
+
+    if marker.exists():
+        try:
+            if _win_safe_read_text(marker).strip() == nas_sig and nas_sig != "missing":
+                logger.info(f"[{WORKER_ID}] Local model cache already up to date: {local_dest}")
+                return local_dest
+        except Exception:
+            pass
+
+    if nas_sig == "missing":
+        logger.error(f"[{WORKER_ID}] NAS model source not found: {nas_source}")
+        return local_dest  # let docling fail loudly if it has to, don't crash here
+
+    logger.info(f"[{WORKER_ID}] Syncing models {nas_source} -> {local_dest} (one-time per machine)")
+
+    if local_dest.exists():
+        shutil.rmtree(local_dest, ignore_errors=True)
+
+    shutil.copytree(nas_source, local_dest)
+    _win_safe_write_text(marker, nas_sig)
+
+    logger.info(f"[{WORKER_ID}] Model sync done")
+    return local_dest
+
+
+LOCAL_DOCLING_DIR = _sync_models_locally(NAS_DOCLING_DIR, LOCAL_CACHE_ROOT)
+
+os.environ["DOCLING_ARTIFACTS_PATH"] = str(LOCAL_DOCLING_DIR)
+# Offline mode now points at a local cache, not a NAS path. That's what
+# actually kills lock-file contention. Pointing offline mode at a shared
+# network path (the old setup) doesn't fix SMB locking, it just removes
+# the network round-trip while leaving the lock contention intact.
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+
+from docling.document_converter import DocumentConverter, PdfFormatOption
+from docling.datamodel.pipeline_options import PdfPipelineOptions, EasyOcrOptions
+from docling.datamodel.base_models import InputFormat
+
+
+# ─────────────────────────────────────────────────────────────
+# Model-init lock. Only protects against concurrent loads WITHIN
+# one process (multiple threads). If the .bat spawns one
+# `python text_workers.py` process per machine, each process owns
+# its own lock object — this does nothing across machines, and
+# doesn't need to anymore, since each machine loads from its own
+# local copy now.
 # ─────────────────────────────────────────────────────────────
 _model_init_lock = threading.Lock()
 _docling_converter = None
@@ -140,7 +223,7 @@ def _get_converter(ocr: bool = False):
             return _docling_converter
 
         if _docling_ocr_converter is None:
-            model_dir = BASE_DIR / "parta" / "portable" / "docling" / "EasyOcr"
+            model_dir = LOCAL_DOCLING_DIR / "EasyOcr"
 
             logger.info(f"[{WORKER_ID}] Initialising OCR converter (models: {model_dir})")
 
@@ -167,31 +250,27 @@ def process_chunk(pdf_bytes: bytes, start_offset: int, ocr_enabled: bool = False
     tmp_path = Path(tempfile.gettempdir()) / f"docling_{uuid.uuid4().hex}_{start_offset}.pdf"
     try:
         tmp_path.write_bytes(pdf_bytes)
-        # note: write_bytes opens and closes the handle in one shot — no
-        # lingering Python handle for Docling to trip over on Windows.
 
         result = converter.convert(tmp_path)
         md_text = result.document.export_to_markdown()
 
-        # Drop Docling's internal reference before we try to delete the file.
-        # Some PDF backends (PyPdfium/PyMuPDF) keep a lazy/mmap-style handle
-        # open until the result object is garbage collected, not the instant
-        # export_to_markdown() returns — that trailing handle is what causes
-        # WinError 32 on the unlink below if we don't release it first.
         del result
-        gc.collect()  # force GC to release any cyclic refs (PyPdfium mmap)
+        gc.collect()
     finally:
-        # retry-with-backoff: antivirus / search indexer / a trailing Docling
-        # handle commonly holds the file for tens-to-hundreds of ms after the
-        # "owning" call returns, even when our own code closed everything
-        _win_safe_unlink(tmp_path)
+        # was a blocking, synchronous retry-unlink. Now handed off to the
+        # background reaper so a slow-to-release handle doesn't stall
+        # the job loop for up to ~38s.
+        _queue_delete(tmp_path)
 
     return f"\n\n## Page {start_offset + 1}\n\n{md_text}".strip()
 
 
 _session = requests.Session()
 
-RESULT_CACHE_DIR = Path(tempfile.gettempdir()) / "worker_result_cache" / "text"
+# Moved off system temp. Windows disk cleanup / some AV tools sweep
+# %TEMP% on their own schedule — that defeats the entire point of a
+# crash/power-cut recovery cache. LOCALAPPDATA persists.
+RESULT_CACHE_DIR = Path(os.environ.get("LOCALAPPDATA", tempfile.gettempdir())) / "worker_result_cache" / "text"
 RESULT_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 
@@ -249,17 +328,14 @@ def start_worker():
     logger.info(f"[{WORKER_ID}] TEXT WORKER STARTED (extraction mode)")
     logger.info(f"[{WORKER_ID}] SERVER      : {SERVER_URL}")
     logger.info(f"[{WORKER_ID}] BASE_DIR    : {BASE_DIR}")
+    logger.info(f"[{WORKER_ID}] MODEL_DIR   : {LOCAL_DOCLING_DIR} (local, synced from NAS)")
     logger.info(f"[{WORKER_ID}] CACHE_DIR   : {RESULT_CACHE_DIR}")
     logger.info("=" * 80)
 
-    # stagger startup slightly — harmless even with the lock in place,
-    # avoids 5 workers hitting the model-init lock at the exact same instant
     time.sleep(random.uniform(0.5, 4.0))
 
     _replay_cached_results()
 
-    # warm up model before entering job loop — fail loud, not silent,
-    # so a broken model path is caught at startup instead of mid-job
     try:
         _get_converter(ocr=False)
     except Exception as e:
@@ -312,7 +388,6 @@ def start_worker():
                 content = process_chunk(chunk_resp.content, start_offset, ocr_enabled)
             except Exception as e:
                 logger.error(f"[{WORKER_ID}] Extraction failed for chunk {chunk_idx}: {e}")
-                # report failure immediately instead of letting the lease expire
                 try:
                     _session.post(
                         f"{SERVER_URL}/submit_result",
