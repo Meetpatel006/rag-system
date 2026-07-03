@@ -14,6 +14,7 @@ import os
 import gc
 import json
 import queue
+import re
 import shutil
 import tempfile
 import time
@@ -274,7 +275,15 @@ def process_chunk(pdf_bytes: bytes, start_offset: int, ocr_enabled: bool = False
         tmp_path.write_bytes(pdf_bytes)
 
         result = converter.convert(tmp_path)
-        md_text = result.document.export_to_markdown()
+        doc = result.document
+
+        page_nos = sorted(doc.pages.keys())
+        parts = []
+        for i, page_no in enumerate(page_nos):
+            absolute_page = start_offset + i + 1
+            page_md = doc.export_to_markdown(page_no=page_no)
+            if page_md.strip():
+                parts.append(f"## --- PAGE {absolute_page} ---\n\n{page_md.strip()}")
 
         del result
         gc.collect()
@@ -284,7 +293,7 @@ def process_chunk(pdf_bytes: bytes, start_offset: int, ocr_enabled: bool = False
         # the job loop for up to ~38s.
         _queue_delete(tmp_path)
 
-    return f"\n\n## Page {start_offset + 1}\n\n{md_text}".strip()
+    return "\n\n".join(parts) if parts else ""
 
 
 _session = requests.Session()
