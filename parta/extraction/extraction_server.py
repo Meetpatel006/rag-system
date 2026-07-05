@@ -29,7 +29,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 import json
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse
 from pypdf import PdfReader, PdfWriter
 
@@ -54,6 +54,13 @@ CHUNK_SIZE = 10
 LEASE_SECONDS = 600
 MAX_ATTEMPTS = 3
 CLEANUP_DELAY_SEC = 300
+# ponytail: hardcoded priority list; move to env/config only if it changes often.
+WORKER_PRIORITY_IPS = [
+    "192.168.1.10",
+    "192.168.1.11",
+    "192.168.1.12",
+]
+PRIORITY_GRACE_SECONDS = 10
 
 # ── In-memory state ───────────────────────────────────────────────────────────
 # Each store maps book_id -> state dict
@@ -61,6 +68,7 @@ extractions: Dict[str, dict] = {}
 neo4j_jobs: Dict[str, dict] = {}
 qdrant_jobs: Dict[str, dict] = {}
 job_lock = threading.Lock()
+worker_last_seen: Dict[str, float] = {}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -160,14 +168,46 @@ def _make_wait_or_shutdown() -> dict:
     return {"action": "WAIT"}
 
 
+def _client_ip(request: Request) -> str:
+    forwarded_for = request.headers.get("x-forwarded-for", "")
+    if forwarded_for:
+        return forwarded_for.split(",", 1)[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
 def _assign_pending_job(
     *,
     store: Dict[str, dict],
     worker_id: str,
+    worker_ip: str = "unknown",
     expected_kind: Optional[str] = None,
     extra_response: Optional[dict] = None,
 ) -> dict:
     now = time.time()
+    if expected_kind:
+        worker_last_seen[f"{expected_kind}:{worker_ip}"] = now
+
+    if expected_kind and WORKER_PRIORITY_IPS:
+        rank = WORKER_PRIORITY_IPS.index(worker_ip) if worker_ip in WORKER_PRIORITY_IPS else len(WORKER_PRIORITY_IPS)
+        active_higher_priority = sum(
+            now - worker_last_seen.get(f"{expected_kind}:{ip}", 0) <= PRIORITY_GRACE_SECONDS
+            for ip in WORKER_PRIORITY_IPS[:rank]
+        )
+        pending_jobs = sum(
+            1
+            for state in store.values()
+            if not state["is_finished"]
+            for job in state["jobs"].values()
+            if job["status"] == "PENDING" and job["job_kind"] == expected_kind
+        )
+        if active_higher_priority and pending_jobs <= active_higher_priority:
+            logger.info(
+                "%s worker %s (%s) waiting for higher-priority worker",
+                expected_kind.upper(),
+                worker_id,
+                worker_ip,
+            )
+            return _make_wait_or_shutdown()
 
     for book_id, state in store.items():
         if state["is_finished"]:
@@ -218,10 +258,11 @@ def _assign_pending_job(
             job["lease_deadline"] = now + LEASE_SECONDS
 
             logger.info(
-                "%s job %s assigned to %s",
+                "%s job %s assigned to %s (%s)",
                 job["job_kind"].upper(),
                 jid,
                 worker_id,
+                worker_ip,
             )
 
             response = {
@@ -438,9 +479,14 @@ def start_extraction(payload: dict):
 
 @app.get("/get_job")
 @time_it
-def get_job(worker_id: str = "unknown"):
+def get_job(request: Request, worker_id: str = "unknown"):
     with job_lock:
-        return _assign_pending_job(store=extractions, worker_id=worker_id, expected_kind="extraction")
+        return _assign_pending_job(
+            store=extractions,
+            worker_id=worker_id,
+            worker_ip=_client_ip(request),
+            expected_kind="extraction",
+        )
 
 
 @app.get("/chunk/{job_id}")
@@ -611,9 +657,14 @@ def start_neo4j(payload: dict):
 
 @app.get("/get_neo4j_job")
 @time_it
-def get_neo4j_job(worker_id: str = "unknown"):
+def get_neo4j_job(request: Request, worker_id: str = "unknown"):
     with job_lock:
-        return _assign_pending_job(store=neo4j_jobs, worker_id=worker_id, expected_kind="neo4j")
+        return _assign_pending_job(
+            store=neo4j_jobs,
+            worker_id=worker_id,
+            worker_ip=_client_ip(request),
+            expected_kind="neo4j",
+        )
 
 
 @app.post("/submit_neo4j_result")
@@ -755,9 +806,14 @@ def start_qdrant(payload: dict):
 
 @app.get("/get_qdrant_job")
 @time_it
-def get_qdrant_job(worker_id: str = "unknown"):
+def get_qdrant_job(request: Request, worker_id: str = "unknown"):
     with job_lock:
-        return _assign_pending_job(store=qdrant_jobs, worker_id=worker_id, expected_kind="qdrant")
+        return _assign_pending_job(
+            store=qdrant_jobs,
+            worker_id=worker_id,
+            worker_ip=_client_ip(request),
+            expected_kind="qdrant",
+        )
 
 
 @app.post("/submit_qdrant_result")
