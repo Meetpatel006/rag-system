@@ -21,38 +21,35 @@ QDRANT_DIR = PARTA_DATA_DIR / "qdrant"
 
 
 # Mongo (same as Part A defaults)
-# MONGO_URI = "mongodb://localhost:27017"
-MONGO_URI = "mongodb+srv://redrepter:ncq4fIo18UK948dV@krutrim.li124fs.mongodb.net/?appName=krutrim"
+MONGO_URI = os.environ.get("MONGO_URI", "mongodb://localhost:27017")
 MONGO_DB =  "rag_system"
 
 
 # JWT — MUST match Part A in production
-JWT_SECRET =  "ISRO_RAG_SECRET_CHANGE_IN_PROD"
+JWT_SECRET = os.environ.get("JWT_SECRET", "ISRO_RAG_SECRET_CHANGE_IN_PROD")
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRE_HOURS =8
 
 # LiteLLM OpenAI-compatible proxy (Master)
 LITELLM_BASE_URL = "http://127.0.0.1:4000/v1"
 # LITELLM_BASE_URL = "https://api.mistral.ai/v1"
-LITELLM_API_KEY = "yU15nPBcRPH0myzxjlZBQATOvDBRSgQB"
+LITELLM_API_KEY = os.environ.get("LITELLM_API_KEY", "")
 
 # If "1", stream from local Ollama /api/generate instead (dev fallback)
 USE_OLLAMA_DIRECT = False
 OLLAMA_URL =  "http://127.0.0.1:11434"
 
 # QDRANT_URL =  "http://localhost:6333"
-QDRANT_URL           = "https://9a5b0165-5dab-4d30-8b0c-95319c7c1191.us-east-2-0.aws.cloud.qdrant.io"
-QDRANT_API_KEY       = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJhY2Nlc3MiOiJtIiwic3ViamVjdCI6ImFwaS1rZXk6ODVhODM3MDEtYWYyMS00MWQ2LTgzOTItN2FmYWExZTQyNTI2In0.FYpoWi_q1lwgOs58R_OqsboC32qWhl60LJXv3Rtg4OY"
+QDRANT_URL           = os.environ.get("QDRANT_URL", "http://localhost:6333")
+QDRANT_API_KEY       = os.environ.get("QDRANT_API_KEY", "")
 COLLECTION_PROPS     = "RAG_PROPOSITIons"
 COLLECTION_SECTIONS = "RAG_sections"
 
 
 # NEO4J_URI = "bolt://localhost:7687"
-# NEO4J_USER = "neo4j"
-# NEO4J_PASSWORD = "sac@1234"
-NEO4J_URI = "neo4j+s://95a8070a.databases.neo4j.io"
-NEO4J_USER = "95a8070a"
-NEO4J_PASSWORD = "39TVuQIDdPNbNnVNgiWGzi_SVl17V-8hetw54nLyI0M"
+NEO4J_URI = os.environ.get("NEO4J_URI", "bolt://localhost:7687")
+NEO4J_USER = os.environ.get("NEO4J_USER", "neo4j")
+NEO4J_PASSWORD = os.environ.get("NEO4J_PASSWORD", "")
 
 import json
 from partb.logger import time_it, async_time_it
@@ -90,24 +87,68 @@ BOOST_BOTH = float(os.environ.get("RAG_BOOST_BOTH", "0.12"))
 LONG_CHUNK_WORDS = int(os.environ.get("RAG_LONG_CHUNK_WORDS", "450"))
 
 # ── Reranker tuning ──────────────────────────────────────────────────────────
-# The bundled CrossEncoder is an XLM-RoBERTa model with max_position_embeddings
-# = 514 (~512 usable tokens). Scoring a full section chunk (>400 words) against a
-# query means it is hard-truncated, so the relevant passage often never reaches
-# the model. RERANK_SEGMENT_* control the segment-max workaround: long candidates
-# are split into overlapping segments and scored as the max segment score.
-RERANK_SEGMENT_TOKENS = int(os.environ.get("RAG_RERANK_SEGMENT_TOKENS", "220"))
-RERANK_FULL_CHUNK_WORDS = int(os.environ.get("RAG_RERANK_FULL_CHUNK_WORDS", "400"))
+# Jina Reranker v3 has 131K context and processes ALL candidate documents
+# listwise in a single forward pass via model.rerank(query, documents).
+# Segment-max pooling is only needed for text exceeding 131K tokens.
+RERANK_SEGMENT_TOKENS = int(os.environ.get("RAG_RERANK_SEGMENT_TOKENS", "60000"))
+RERANK_FULL_CHUNK_WORDS = int(os.environ.get("RAG_RERANK_FULL_CHUNK_WORDS", "80000"))
 
-# Drop candidates whose rerank score is below this floor. The bundled reranker's
-# sentence_bert_config.json declares activation_fn=Sigmoid, so scores are in 0..1.
-# Tune empirically after reading the score-distribution logs (rerank_candidates
-# logs min/median/max per query). 0.0 = no filtering.
+# Drop candidates whose rerank score is below this floor. Jina Reranker v3
+# produces unbounded logit scores (not sigmoid-squashed), so the absolute
+# values differ from the previous BGE model. Tune empirically after reading
+# the score-distribution logs (rerank_candidates logs min/median/max per
+# query). 0.0 = no filtering.
 RERANK_MIN_SCORE = float(os.environ.get("RAG_RERANK_MIN_SCORE", "0.0"))
 
 # Score-distribution logging sample rate — log min/median/max of rerank scores
 # once per N queries so you can calibrate RERANK_MIN_SCORE / BOOST_BOTH.
 RERANK_LOG_DISTRIBUTION_EVERY = int(os.environ.get("RAG_RERANK_LOG_DIST_EVERY", "1"))
 
+
+# MMR (Maximum Marginal Relevance) diversity
+ENABLE_MMR = os.environ.get("RAG_ENABLE_MMR", "0") == "1"
+MMR_LAMBDA = float(os.environ.get("RAG_MMR_LAMBDA", "0.7"))
+MMR_POOL_MULTIPLIER = int(os.environ.get("RAG_MMR_POOL_MULTIPLIER", "2"))
+
+
+# Query classification & routing
+ENABLE_QUERY_CLASSIFICATION = os.environ.get("RAG_ENABLE_QUERY_CLASSIFICATION", "1") == "1"
+
+# Per-(mode, query_type) overrides applied on top of MODE_CONFIG.
+# Each key: mode -> query_type -> {overrides}
+#   boost_both_mult:        Multiplier for BOOST_BOTH when a candidate comes from both Qdrant + Neo4j
+#   page_expand_range:      Pages before/after the main page to fetch (0 = no expansion)
+#   final_top_n_adjust:     Added to the mode's final_top_n (can be negative)
+#   context_max_chars_adjust: Added to the mode's context_max_chars (can be negative)
+#   cross_book:             If True, ignore user's book filter and search all books
+QUERY_TYPE_OVERRIDES: dict[str, dict[str, dict]] = {
+    "fast": {
+        "spec_lookup": {"boost_both_mult": 2.0, "page_expand_range": 1, "final_top_n_adjust": 0, "context_max_chars_adjust": 0, "cross_book": False},
+        "process":     {"boost_both_mult": 1.0, "page_expand_range": 2, "final_top_n_adjust": 0, "context_max_chars_adjust": 0, "cross_book": False},
+        "comparison":  {"boost_both_mult": 1.5, "page_expand_range": 1, "final_top_n_adjust": 2, "context_max_chars_adjust": 0, "cross_book": True},
+        "overview":    {"boost_both_mult": 1.0, "page_expand_range": 0, "final_top_n_adjust": -3, "context_max_chars_adjust": -2000, "cross_book": False},
+    },
+    "balanced": {
+        "spec_lookup": {"boost_both_mult": 2.0, "page_expand_range": 1, "final_top_n_adjust": 0, "context_max_chars_adjust": 0, "cross_book": False},
+        "process":     {"boost_both_mult": 1.0, "page_expand_range": 2, "final_top_n_adjust": 2, "context_max_chars_adjust": 2000, "cross_book": False},
+        "comparison":  {"boost_both_mult": 1.5, "page_expand_range": 1, "final_top_n_adjust": 4, "context_max_chars_adjust": 2000, "cross_book": True},
+        "overview":    {"boost_both_mult": 1.0, "page_expand_range": 0, "final_top_n_adjust": -2, "context_max_chars_adjust": -4000, "cross_book": False},
+    },
+    "deep": {
+        "spec_lookup": {"boost_both_mult": 2.0, "page_expand_range": 1, "final_top_n_adjust": 0, "context_max_chars_adjust": 0, "cross_book": False},
+        "process":     {"boost_both_mult": 1.0, "page_expand_range": 2, "final_top_n_adjust": 2, "context_max_chars_adjust": 2000, "cross_book": False},
+        "comparison":  {"boost_both_mult": 1.5, "page_expand_range": 1, "final_top_n_adjust": 4, "context_max_chars_adjust": 2000, "cross_book": True},
+        "overview":    {"boost_both_mult": 1.0, "page_expand_range": 0, "final_top_n_adjust": -3, "context_max_chars_adjust": -2000, "cross_book": False},
+    },
+}
+
+# Defaults when no type-specific override is defined (e.g. "general" type)
+QUERY_TYPE_GENERAL = {"boost_both_mult": 1.0, "page_expand_range": 1, "final_top_n_adjust": 0, "context_max_chars_adjust": 0, "cross_book": False}
+
+
+# Greedy context allocation — select items by value density (score/chars)
+# instead of fixed priority order (specs → pages → chunks).
+CONTEXT_GREEDY = os.environ.get("RAG_CONTEXT_GREEDY", "1") == "1"
 
 
 # Apply Qdrant/Neo env for processing.* imports (ingest_vectors / ingest_graph)

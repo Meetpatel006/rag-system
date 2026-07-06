@@ -7,7 +7,7 @@ CHANGES IN THIS VERSION vs previous:
 
   NEW — Step 7: Page Expansion
   ─────────────────────────────
-  After CrossEncoder reranking (Step 6), the pipeline now expands the
+  After Jina Reranker v3 listwise reranking (Step 6), the pipeline now expands the
   top ranked chunks to full page content using {book_id}_metadata.json
   produced by Part A's build_metadata.py.
 
@@ -63,10 +63,15 @@ from partb.config import (
     BOOST_BOTH,
     COLLECTION_PROPS,
     COLLECTION_SECTIONS,
+    CONTEXT_GREEDY,
+    ENABLE_MMR,
+    ENABLE_QUERY_CLASSIFICATION,
     ENTITY_LABELS,
     GLINER_QUERY_THRESHOLD,
     LONG_CHUNK_WORDS,
     METADATA_DIR,
+    MMR_LAMBDA,
+    MMR_POOL_MULTIPLIER,
     MODE_CONFIG,
     NEO4J_ENTITY_LIMIT,
     NEO4J_PASSWORD,
@@ -77,6 +82,8 @@ from partb.config import (
     PORTABLE_DIR,
     PROP_RETRIEVE_LIMIT,
     QDRANT_URL,
+    QUERY_TYPE_GENERAL,
+    QUERY_TYPE_OVERRIDES,
     RERANKER_DIR,
     RERANK_FULL_CHUNK_WORDS,
     RERANK_LOG_DISTRIBUTION_EVERY,
@@ -84,7 +91,7 @@ from partb.config import (
     RERANK_SEGMENT_TOKENS,
     SECT_RETRIEVE_LIMIT,
 )
-from partb.logger import async_time_it, log_process, logger, time_it
+from partb.logger import log_process, logger, time_it
 from partb.retrieval.prompts import get_system_prompt
 
 logging.getLogger("transformers").setLevel(logging.ERROR)
@@ -137,12 +144,13 @@ def get_neo4j():
 def get_reranker():
     global _reranker
     if _reranker is None:
-        from sentence_transformers import CrossEncoder
+        from transformers import AutoModel
 
         cfg_path = RERANKER_DIR / "config.json"
         if not cfg_path.is_file():
             raise FileNotFoundError(f"Reranker not found at {RERANKER_DIR}")
-        _reranker = CrossEncoder(str(RERANKER_DIR))
+        _reranker = AutoModel.from_pretrained(str(RERANKER_DIR), trust_remote_code=True)
+        _reranker.eval()
     return _reranker
 
 
@@ -185,69 +193,107 @@ def warm_models() -> None:
 
 
 @time_it
+def _format_pipe_table(headers: list[str], rows: list[dict]) -> str:
+    """
+    Builds a Markdown pipe table from headers and row dicts.
+
+    Columns are padded to the widest value (or header length) for clean alignment.
+    Special characters like newlines and pipe chars in cell values are escaped.
+
+    Returns the table body (no label prefix) or empty string on failure.
+    """
+    if not headers or not rows:
+        return ""
+
+    # Compute column widths (header or data, whichever is wider)
+    col_widths: list[int] = []
+    for h in headers:
+        h_str = str(h) if h else ""
+        max_w = len(h_str)
+        for row in rows:
+            v = str(row.get(h, "") or "")
+            # Replace escaped pipe for width calculation
+            v_clean = v.replace("\\|", "|")
+            max_w = max(max_w, len(v_clean))
+        col_widths.append(max_w)
+
+    # Sanitize a cell value: escape pipe chars, replace newlines with spaces
+    def _sanitize(val: object) -> str:
+        s = str(val) if val is not None else ""
+        s = s.replace("|", "\\|")
+        s = s.replace("\n", " ").replace("\r", "")
+        return s
+
+    lines: list[str] = []
+
+    # Header row
+    header_cells = [_sanitize(h).ljust(col_widths[i]) for i, h in enumerate(headers)]
+    lines.append("| " + " | ".join(header_cells) + " |")
+
+    # Separator row
+    sep_cells = ["-" * w for w in col_widths]
+    lines.append("| " + " | ".join(sep_cells) + " |")
+
+    # Data rows
+    for row in rows:
+        data_cells = []
+        for i, h in enumerate(headers):
+            v = _sanitize(row.get(h, ""))
+            data_cells.append(v.ljust(col_widths[i]))
+        lines.append("| " + " | ".join(data_cells) + " |")
+
+    return "\n".join(lines)
+
+
+@time_it
 def format_table_for_llm(chunk: dict) -> str:
     """
-    Converts a table chunk into LLM-readable bullet list format.
-    Priority: structured_json → linearized_text → raw text.
+    Converts a table chunk into LLM-readable format.
+
+    Priority:
+      1. structured_json → Markdown pipe table (best for LLM comprehension)
+      2. linearized_text → formatted as block text
+      3. raw text → formatted as block text
+
+    Returns the full formatted string including source label, or "" if empty.
     """
     section_path = chunk.get("section_path") or []
     section_label = " > ".join(section_path) if section_path else "Unknown Section"
     pr = chunk.get("page_range") or [0, 0]
     bid = chunk.get("book_id") or "?"
+    # Enhanced citation with section name: [Book: X | § Section Name | Page: Y]
+    citation = (
+        f"[Book: {bid} | § {section_label} | Page: {pr[0]}-{pr[1]}]"
+        if section_label != "Unknown Section"
+        else f"[Book: {bid} | Page: {pr[0]}-{pr[1]}]"
+    )
+    source_label = f"Specification Data: {citation}:"
 
+    # ── Path 1: structured_json → Markdown pipe table ─────────────────
     structured = chunk.get("structured_json")
     if structured and isinstance(structured, dict):
         headers = structured.get("headers") or []
         rows = structured.get("rows") or []
-
         if headers and rows:
-            lines = [
-                f"Specification Data [{section_label}] [Book: {bid} | Page: {pr[0]}-{pr[1]}]:"
-            ]
-            for row in rows:
-                lowered = {k.lower().strip(): v for k, v in row.items()}
-                param = (
-                    lowered.get("parameter")
-                    or lowered.get("item")
-                    or lowered.get("name")
-                    or lowered.get("description")
-                    or lowered.get("property")
-                    or lowered.get("characteristic")
-                    or next(iter(row.values()), "")
-                )
-                value = (
-                    lowered.get("value")
-                    or lowered.get("values")
-                    or lowered.get("data")
-                    or lowered.get("result")
-                    or lowered.get("measurement")
-                    or ""
-                )
-                unit = lowered.get("unit") or lowered.get("units") or ""
-                if param and value:
-                    unit_str = f" {str(unit).strip()}" if str(unit).strip() else ""
-                    lines.append(f"  - {param}: {value}{unit_str}")
-                else:
-                    parts = []
-                    for h in headers:
-                        v = (row.get(h) or "").strip()
-                        if v:
-                            parts.append(f"{h}: {v}")
-                    if parts:
-                        lines.append("  - " + " | ".join(parts))
-            if len(lines) > 1:
-                return "\n".join(lines)
+            pipe_table = _format_pipe_table(headers, rows)
+            if pipe_table:
+                return f"{source_label}\n{pipe_table}"
 
+    # ── Path 2: linearized_text ────────────────────────────────────────
     linearized = (chunk.get("linearized_text") or "").strip()
     if linearized and len(linearized) > 30:
-        return (
-            f"Specification Data [{section_label}] [Book: {bid} | Page: {pr[0]}-{pr[1]}]:\n"
-            f"{linearized}"
-        )
+        return f"{source_label}\n{linearized}"
 
+    # ── Path 3: raw text ───────────────────────────────────────────────
     raw = (chunk.get("text") or chunk.get("content") or "").strip()
     if raw:
-        return f"Data [{section_label}] [Book: {bid} | Page: {pr[0]}-{pr[1]}]:\n{raw}"
+        citation = (
+            f"[Book: {bid} | § {section_label} | Page: {pr[0]}-{pr[1]}]"
+            if section_label != "Unknown Section"
+            else f"[Book: {bid} | Page: {pr[0]}-{pr[1]}]"
+        )
+        return f"Data: {citation}:\n{raw}"
+
     return ""
 
 
@@ -439,8 +485,18 @@ def neo4j_specs_for_terms(book_ids: list[str], entity_terms: list[str]) -> list[
 
 
 @time_it
-def _parse_payload(pl: dict, pid: str) -> dict:
-    """Parses a Qdrant section payload into a standard dict."""
+def _parse_payload(pl: dict, pid: str, vector: list[float] | None = None) -> dict:
+    """Parses a Qdrant section payload into a standard dict.
+
+    In qdrant_client v1.12+, the .vector attribute on ScoredPoint may
+    return a dict (keyed by vector name, e.g. {"": [...]} for unnamed)
+    instead of a flat list. We normalize to flat list here so downstream
+    consumers (_cosine_sim, mmr_select) always get a list.
+    """
+    # Normalize: Qdrant named-vector dict → flat list
+    if isinstance(vector, dict):
+        # Unnamed vector key is "" or the first key
+        vector = next(iter(vector.values()), None)
     pr = pl.get("page_range")
     page_list = (
         [pr.get("start", 0), pr.get("end", 0)]
@@ -461,6 +517,7 @@ def _parse_payload(pl: dict, pid: str) -> dict:
         "from_qdrant": True,
         "from_neo4j": False,
         "qdrant_score": None,
+        "vector": vector,
     }
 
 
@@ -488,9 +545,11 @@ def fetch_sections_by_chunk_ids(
                 ),
                 limit=len(batch_ids),
                 with_payload=True,
+                with_vectors=ENABLE_MMR,
             )
             for p in pts:
-                results.append(_parse_payload(p.payload or {}, str(p.id)))
+                vec = getattr(p, "vector", None) if ENABLE_MMR else None
+                results.append(_parse_payload(p.payload or {}, str(p.id), vector=vec))
         except Exception as exc:
             logging.warning("Section fetch batch failed: %s", exc)
     return results
@@ -520,6 +579,7 @@ def search_sections_direct(
             query_filter=filters,
             limit=limit,
             with_payload=True,
+            with_vectors=ENABLE_MMR,
         )
         hits = response.points
     except Exception as exc:
@@ -532,7 +592,8 @@ def search_sections_direct(
         if cid in seen:
             continue
         seen.add(cid)
-        s = _parse_payload(h.payload or {}, cid)
+        vec = getattr(h, "vector", None) if ENABLE_MMR else None
+        s = _parse_payload(h.payload or {}, cid, vector=vec)
         s["qdrant_score"] = h.score
         s["from_neo4j"] = (
             any(n in (s.get("section_path") or []) for n in section_names)
@@ -574,22 +635,36 @@ def merge_candidates(
 
 
 @log_process
-def rerank_candidates(query: str, candidates: list[dict], top_n: int) -> list[dict]:
+def rerank_candidates(query: str, candidates: list[dict], top_n: int, boost_mult: float = 1.0) -> list[dict]:
+    """
+    Rerank candidates using the Jina Reranker v3 listwise model.
+
+    Args:
+        query:     The user query.
+        candidates: List of candidate dicts with 'text' key.
+        top_n:     Number of top candidates to return.
+        boost_mult: Multiplier for BOOST_BOTH when a candidate comes from
+                    both Qdrant and Neo4j. Used by query classification to
+                    boost spec_lookup candidates higher.
+    """
     if not candidates:
         return []
     try:
-        ce = get_reranker()
-        for c in candidates:
-            c["rerank_score"] = _rerank_score_one(ce, query, c.get("text") or "")
-            if c.get("from_qdrant") and c.get("from_neo4j"):
-                c["rerank_score"] += BOOST_BOTH
+        reranker = get_reranker()
+        texts = [c.get("text", "") or "" for c in candidates]
+        results = reranker.rerank(query, texts)
+        for r in results:
+            idx = r["index"]
+            candidates[idx]["rerank_score"] = r["relevance_score"]
+            if candidates[idx].get("from_qdrant") and candidates[idx].get("from_neo4j"):
+                candidates[idx]["rerank_score"] += BOOST_BOTH * boost_mult
     except Exception as exc:
         logging.warning("Reranker failed (%s); using Qdrant scores.", exc)
         for c in candidates:
             base = c.get("qdrant_score")
             c["rerank_score"] = float(base) if isinstance(base, (int, float)) else 0.0
             if c.get("from_qdrant") and c.get("from_neo4j"):
-                c["rerank_score"] += BOOST_BOTH
+                c["rerank_score"] += BOOST_BOTH * boost_mult
 
     # Score-distribution logging (sampled) so RERANK_MIN_SCORE / BOOST_BOTH can
     # be calibrated against real data rather than guessed.
@@ -607,7 +682,7 @@ def rerank_candidates(query: str, candidates: list[dict], top_n: int) -> list[di
             )
             logger.info(
                 "[RERANK] dist | n=%d | min=%.4f | median=%.4f | max=%.4f | "
-                "boosted=%d | top1_score=%.4f | floor=%.4f",
+                "boosted=%d | top1_score=%.4f | floor=%.4f | boost_mult=%.1f",
                 n,
                 raw[0],
                 median,
@@ -615,6 +690,7 @@ def rerank_candidates(query: str, candidates: list[dict], top_n: int) -> list[di
                 boosted,
                 raw[-1],
                 RERANK_MIN_SCORE,
+                boost_mult,
             )
 
     # Score floor — drop candidates that scored below the configured minimum.
@@ -632,7 +708,81 @@ def rerank_candidates(query: str, candidates: list[dict], top_n: int) -> list[di
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STEP 7 — PAGE EXPANSION  ← NEW
+# STEP 6b — MMR DIVERSITY
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@time_it
+def _cosine_sim(a: list[float], b: list[float]) -> float:
+    """Cosine similarity between two vectors."""
+    if not a or not b:
+        return 0.0
+    dot = sum(ai * bi for ai, bi in zip(a, b))
+    norm_a = sum(ai * ai for ai in a) ** 0.5
+    norm_b = sum(bi * bi for bi in b) ** 0.5
+    if norm_a == 0 or norm_b == 0:
+        return 0.0
+    return dot / (norm_a * norm_b)
+
+
+@time_it
+def mmr_select(candidates: list[dict], top_n: int, lambda_: float = 0.7) -> list[dict]:
+    """
+    Maximum Marginal Relevance selection to balance relevance vs. diversity.
+
+    MMR = λ * relevance(c) - (1-λ) * max_{j in selected} similarity(c, c_j)
+
+    Uses rerank_score as the relevance term and cosine similarity between
+    Nomic embedding vectors for the diversity penalty. Candidates without
+    a stored vector fall back to pure relevance ordering.
+
+    Args:
+        candidates: List of candidate dicts sorted by rerank_score descending.
+                    Each should have 'rerank_score' and optionally 'vector'.
+        top_n:      Number of candidates to select.
+        lambda_:    Trade-off parameter. 1.0 = pure relevance, 0.0 = pure diversity.
+
+    Returns:
+        top_n candidates reordered by MMR score, maintaining the original
+        dict structure so downstream code (page expansion, context building)
+        is unaffected.
+    """
+    if not candidates or top_n <= 0:
+        return []
+    if top_n >= len(candidates):
+        return list(candidates)
+
+    selected: list[dict] = []
+    remaining = list(candidates)
+
+    # Seed with the highest-relevance candidate (already first after reranker sort)
+    selected.append(remaining.pop(0))
+
+    while len(selected) < top_n and remaining:
+        mmr_scores = []
+        for c in remaining:
+            rel = c.get("rerank_score", 0.0)
+            c_vec = c.get("vector")
+            if c_vec is None:
+                # No vector available — pure relevance
+                mmr_scores.append(rel)
+                continue
+
+            # Diversity term: max similarity to any already-selected candidate
+            max_sim = max(
+                (_cosine_sim(c_vec, s.get("vector", [])) if s.get("vector") else 0.0)
+                for s in selected
+            )
+            mmr_scores.append(lambda_ * rel - (1.0 - lambda_) * max_sim)
+
+        best_idx = max(range(len(remaining)), key=lambda i: mmr_scores[i])
+        selected.append(remaining.pop(best_idx))
+
+    return selected
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 7 — PAGE EXPANSION
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -677,14 +827,17 @@ def load_page_content(book_id: str, page_number: int) -> str | None:
 
 
 @log_process
-def expand_to_pages(top_chunks: list[dict]) -> tuple[list[str], list[dict]]:
+def expand_to_pages(
+    top_chunks: list[dict],
+    page_expand_range: int = 1,
+) -> tuple[list[str], list[dict]]:
     """
     Step 7: Expands top ranked chunks to full page content from metadata.
 
-    rank-1 chunk on page N:
-      → fetch pages N-1, N, N+1
+    rank-1 chunk on page N with page_expand_range=R:
+      → fetch pages N-R .. N .. N+R
       → cap combined at PAGE_EXPAND_MAX_CHARS
-      → if over cap: drop N-1 first, then trim N+1 tail
+      → if over cap: drop outermost pages first, then trim the far edge
 
     rank-2 chunk:
       → fetch its single page only
@@ -692,6 +845,13 @@ def expand_to_pages(top_chunks: list[dict]) -> tuple[list[str], list[dict]]:
 
     ranks 3+:
       → not expanded here — handled by fallback chunk text in build_context()
+
+    Args:
+        top_chunks:       List of reranked chunks.
+        page_expand_range: Number of pages to fetch before/after the main page.
+                           0 = main page only (no adjacent expansion).
+                           1 = N-1, N, N+1 (default, current behaviour).
+                           2 = N-2, N-1, N, N+1, N+2.
 
     Returns:
         (page_blocks, expansions)
@@ -734,39 +894,80 @@ def expand_to_pages(top_chunks: list[dict]) -> tuple[list[str], list[dict]]:
             })
         return content
 
-    # ── Rank-1: 3-page expansion (N-1, N, N+1) ───────────────────────────────
+    # ── Rank-1: dynamic multi-page expansion (N-R .. N .. N+R) ────────────────
     rank1 = top_chunks[0]
     bid1 = rank1.get("book_id") or ""
     pr1 = rank1.get("page_range") or [0, 0]
     n1 = int(pr1[0]) if pr1 else 0
     cid1 = rank1.get("chunk_id") or ""
 
-    if bid1 and n1 > 0:
-        prev_content = _fetch(bid1, n1 - 1, cid1, 1, "prev")  # N-1
-        main_content = _fetch(bid1, n1, cid1, 1, "main")      # N
-        next_content = _fetch(bid1, n1 + 1, cid1, 1, "next")  # N+1
-
-        # Enforce combined character budget
-        combined_len = sum(
-            len(c) for c in [prev_content, main_content, next_content] if c
-        )
-
-        if combined_len > PAGE_EXPAND_MAX_CHARS:
-            # Drop N-1 first (least critical of the three)
-            if prev_content:
-                combined_len -= len(prev_content)
-                prev_content = None
-            # Trim N+1 tail if still over budget
-            if combined_len > PAGE_EXPAND_MAX_CHARS and next_content:
-                trim_to = PAGE_EXPAND_MAX_CHARS - len(main_content or "")
-                if trim_to > 200:
-                    next_content = next_content[:trim_to]
-                else:
-                    next_content = None
-
-        for content in [prev_content, main_content, next_content]:
+    if bid1 and n1 > 0 and page_expand_range > 0:
+        # Fetch all pages in range [N-R, N+R]
+        # Use parallel dicts keyed by offset so expansions stay aligned with
+        # page_contents when budget trimming drops pages.
+        page_contents: dict[int, str] = {}
+        rank1_expansions: dict[int, dict] = {}
+        for offset in range(-page_expand_range, page_expand_range + 1):
+            page_num = n1 + offset
+            if page_num < 0:
+                continue
+            key = (bid1, page_num)
+            if key in fetched_pages:
+                continue
+            if offset < 0:
+                relation = "prev"
+            elif offset == 0:
+                relation = "main"
+            else:
+                relation = "next"
+            content = load_page_content(bid1, page_num)
             if content:
-                page_blocks.append(content)
+                fetched_pages.add(key)
+                page_contents[offset] = content
+                rank1_expansions[offset] = {
+                    "book_id": bid1,
+                    "page": page_num,
+                    "expanded_from_chunk_id": cid1,
+                    "rank": 1,
+                    "relation": relation,
+                }
+
+        # Enforce combined character budget — drop outermost pages first
+        combined_len = sum(len(c) for c in page_contents.values())
+        if combined_len > PAGE_EXPAND_MAX_CHARS and len(page_contents) > 1:
+            # Sort offsets by absolute distance from main (furthest first)
+            offsets = sorted(page_contents.keys(), key=lambda o: abs(o), reverse=True)
+            for offset in offsets:
+                if combined_len <= PAGE_EXPAND_MAX_CHARS:
+                    break
+                if offset == 0:
+                    continue  # never drop the main page
+                combined_len -= len(page_contents[offset])
+                del page_contents[offset]
+                del rank1_expansions[offset]
+
+        # Trim the farthest remaining non-main page if still over budget
+        if combined_len > PAGE_EXPAND_MAX_CHARS and len(page_contents) > 1:
+            offsets = sorted(page_contents.keys(), key=lambda o: abs(o), reverse=True)
+            for offset in offsets:
+                if offset == 0:
+                    continue
+                trim_to = len(page_contents[offset]) - (combined_len - PAGE_EXPAND_MAX_CHARS)
+                if trim_to > 200:
+                    page_contents[offset] = page_contents[offset][:trim_to]
+                    combined_len = sum(len(c) for c in page_contents.values())
+                break  # only trim one page
+
+        # Append in reading order (ascending page number)
+        for offset in sorted(page_contents.keys()):
+            page_blocks.append(page_contents[offset])
+            expansions.append(rank1_expansions[offset])
+
+    elif bid1 and n1 > 0 and page_expand_range == 0:
+        # page_expand_range=0: main page only, no adjacent expansion
+        main_content = _fetch(bid1, n1, cid1, 1, "main")
+        if main_content:
+            page_blocks.append(main_content)
 
     elif bid1:
         # page_range missing or zero — attempt to fetch page 0 as fallback
@@ -796,6 +997,18 @@ def expand_to_pages(top_chunks: list[dict]) -> tuple[list[str], list[dict]]:
 
 
 @time_it
+def _first_sentence(text: str) -> str:
+    """Extract the first sentence from text, up to 200 chars."""
+    text = (text or "").strip()
+    if not text:
+        return ""
+    sents = _sentences(text)
+    if sents:
+        return sents[0][:200]
+    return text[:200]
+
+
+@time_it
 def _sentences(text: str) -> list[str]:
     try:
         import nltk
@@ -817,8 +1030,9 @@ def _segment_windows(text: str, max_words: int) -> list[str]:
     aligned on sentence boundaries. Each window starts ~25% into the previous
     one so a relevant passage straddling a boundary is still scored intact.
 
-    Used to defeat CrossEncoder truncation at rerank time: a long section chunk
-    is scored as the MAX over its windows rather than the (truncated) whole.
+    Safety net for extremely long text — Jina Reranker v3 handles 131K
+    tokens so most chunks score in a single pass, but beyond that we
+    segment-max pool.
     """
     text = (text or "").strip()
     if not text:
@@ -849,29 +1063,244 @@ def _segment_windows(text: str, max_words: int) -> list[str]:
     return [w for w in windows if w]
 
 
-@time_it
-def _rerank_score_one(ce, query: str, text: str) -> float:
-    """
-    Scores a single (query, chunk) pair, segment-max pooling long chunks.
-
-    The CrossEncoder truncates at ~512 tokens. For chunks longer than
-    RERANK_FULL_CHUNK_WORDS we split into windows and take the max score, so a
-    relevant passage sitting past the truncation point is still found.
-    """
-    text = (text or "").strip()
-    if not text:
-        return 0.0
-    if len(text.split()) <= RERANK_FULL_CHUNK_WORDS:
-        return float(ce.predict([(query, text)])[0])
-    windows = _segment_windows(text, RERANK_SEGMENT_TOKENS)
-    if not windows:
-        return float(ce.predict([(query, text[: RERANK_SEGMENT_TOKENS * 5])])[0])
-    scores = ce.predict([(query, w) for w in windows])
-    return float(max(scores)) if len(scores) else 0.0
-
-
 # Monotonic query counter for sampling score-distribution log output.
 _rerank_log_counter = 0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GREEDY CONTEXT ASSEMBLY (4.1a)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@log_process
+def _build_context_greedy(
+    chunks: list[dict],
+    query: str,
+    specs: list[dict],
+    max_chars: int,
+    page_blocks: list[str] | None = None,
+    expansions: list[dict] | None = None,
+) -> tuple[str, dict]:
+    """
+    Greedy context assembly — selects items by value density (score/char)
+    instead of fixed priority order (specs → pages → chunks).
+
+    Algorithm:
+      1. Always include spec block first (highest value density, small footprint).
+      2. Build an item pool from page expansions + fallback chunks.
+      3. Score each item by rerank_score / len(text) (value density).
+      4. Sort by density descending; pick greedily until budget is full.
+      5. Tables kept atomic: if a table doesn't fit the remaining budget, skip it.
+
+    Usage tracking: page_blocks retain their expansion metadata so the source
+    list in retrieve_bundle() reflects what the LLM actually saw.
+
+    Returns (context, usage) with the same schema as build_context().
+    """
+    parts: list[str] = []
+    total = 0
+    usage: dict[str, Any] = {
+        "used_chunk_ids": set(),
+        "used_pages": [],
+        "specs_included": False,
+        "total_chars": 0,
+    }
+
+    # ── Block 1: Spec nodes (always included, highest priority) ──
+    spec_block = format_specs_block(specs)
+    if spec_block:
+        parts.append(spec_block)
+        total += len(spec_block)
+        usage["specs_included"] = True
+
+    if total >= max_chars:
+        context = "\n\n---\n\n".join(parts)
+        usage["total_chars"] = len(context)
+        return context, usage
+
+    # ── Build a chunk_id → rerank_score map for page-expansion scoring ──
+    chunk_score_map: dict[str, float] = {
+        c.get("chunk_id", ""): c.get("rerank_score", 0.0)
+        for c in chunks
+        if c.get("chunk_id")
+    }
+
+    # ── Helper to format a text chunk with label and long-chunk handling ──
+    _greedy_reranker = None  # local ref for long-chunk segmentation
+
+    def _format_text_chunk(c: dict) -> str | None:
+        nonlocal _greedy_reranker
+        text = (c.get("text") or "").strip()
+        if not text:
+            return None
+        pr = c.get("page_range") or [0, 0]
+        bid = c.get("book_id") or "?"
+        path_s = " > ".join(c.get("section_path") or [])
+        # Enhanced citation: [Book: X | § Section Name | Page: Y]
+        citation = (
+            f"[Book: {bid} | § {path_s} | Page: {pr[0]}-{pr[1]}]"
+            if path_s
+            else f"[Book: {bid} | Page: {pr[0]}-{pr[1]}]"
+        )
+        label = citation + "\n"
+
+        if len(text.split()) <= LONG_CHUNK_WORDS:
+            return label + text
+
+        # Long chunk: segment on sentences, rerank segments, pick best
+        sents = _sentences(text)
+        segs: list[str] = []
+        cur = ""
+        for s in sents:
+            if len(cur.split()) + len(s.split()) <= 220:
+                cur = (cur + " " + s).strip()
+            else:
+                if cur:
+                    segs.append(cur)
+                cur = s
+        if cur:
+            segs.append(cur)
+        if not segs:
+            return label + text[:4000]
+
+        try:
+            if _greedy_reranker is None:
+                _greedy_reranker = get_reranker()
+            seg_results = _greedy_reranker.rerank(query, segs)
+            best_i = seg_results[0]["index"]
+            return label + segs[best_i]
+        except Exception:
+            return label + segs[0][:4000]
+
+    # ── Build item pool ────────────────────────────────────────────────
+    # Each item: {text, score, density, type, chunk_id, expansion_idx}
+    items: list[dict] = []
+
+    # Add page blocks from expansion — inherit score from source chunk
+    if page_blocks and expansions:
+        exp_by_idx = expansions  # aligned 1:1 with page_blocks
+        for i, pb in enumerate(page_blocks):
+            if not pb or not pb.strip():
+                continue
+            score = 0.0
+            if i < len(exp_by_idx):
+                src_cid = exp_by_idx[i].get("expanded_from_chunk_id")
+                if src_cid:
+                    score = chunk_score_map.get(src_cid, 0.0)
+            density = score / max(1, len(pb))
+            items.append({
+                "text": pb,
+                "score": score,
+                "density": density,
+                "type": "page",
+                "chunk_id": None,
+                "expansion_idx": i,
+            })
+
+    # Add fallback chunks (skip chunks whose IDs were covered by page expansion)
+    expanded_cids: set[str] = set()
+    if expansions:
+        for e in expansions:
+            cid = e.get("expanded_from_chunk_id")
+            if cid:
+                expanded_cids.add(cid)
+    if expanded_cids:
+        fallback_chunks = [
+            c for c in chunks if c.get("chunk_id") not in expanded_cids
+        ]
+    else:
+        fallback_chunks = chunks
+    for c in fallback_chunks:
+        chunk_type = c.get("chunk_type", "text")
+        cid = c.get("chunk_id", "")
+        score = c.get("rerank_score", 0.0)
+
+        if chunk_type == "table":
+            block = format_table_for_llm(c)
+            if not block:
+                raw = (c.get("text") or "").strip()
+                if raw:
+                    pr = c.get("page_range") or [0, 0]
+                    bid = c.get("book_id") or "?"
+                    path_s = " > ".join(c.get("section_path") or [])
+                    citation = (
+                        f"[Table | Book: {bid} | § {path_s} | Page: {pr[0]}-{pr[1]}]"
+                        if path_s
+                        else f"[Table | Book: {bid} | Page: {pr[0]}-{pr[1]}]"
+                    )
+                    block = f"{citation}\n{raw}"
+            if not block:
+                continue
+            density = score / max(1, len(block))
+            items.append({
+                "text": block,
+                "score": score,
+                "density": density,
+                "type": "table",
+                "chunk_id": cid,
+                "expansion_idx": None,
+            })
+        else:
+            block = _format_text_chunk(c)
+            if not block:
+                continue
+            density = score / max(1, len(block))
+            items.append({
+                "text": block,
+                "score": score,
+                "density": density,
+                "type": "chunk",
+                "chunk_id": cid,
+                "expansion_idx": None,
+            })
+
+    # ── Sort by density descending ──
+    items.sort(key=lambda x: x["density"], reverse=True)
+
+    # ── Greedily select items until budget is full ──
+    for item in items:
+        text = item["text"]
+        text_len = len(text)
+
+        # Tables: keep atomic — skip if doesn't fully fit
+        if item["type"] == "table":
+            if total + text_len > max_chars:
+                continue
+        elif item["type"] == "page":
+            # Page blocks: trim if partial fits, skip if too small remnant
+            if total + text_len > max_chars:
+                remaining = max_chars - total
+                if remaining > 500:
+                    text = text[:remaining]
+                    text_len = len(text)
+                else:
+                    continue
+        else:
+            # Chunks: trim if partial fits
+            if total + text_len > max_chars:
+                remaining = max_chars - total
+                if remaining > 200:
+                    text = text[:remaining]
+                    text_len = len(text)
+                else:
+                    continue
+
+        parts.append(text)
+        total += text_len
+
+        # Track usage
+        if item["type"] == "page" and item["expansion_idx"] is not None:
+            if expansions and item["expansion_idx"] < len(expansions):
+                usage["used_pages"].append(expansions[item["expansion_idx"]])
+        elif item.get("chunk_id"):
+            usage["used_chunk_ids"].add(item["chunk_id"])
+
+        if total >= max_chars:
+            break
+
+    context = "\n\n---\n\n".join(parts)
+    usage["total_chars"] = len(context)
+    return context, usage
 
 
 @log_process
@@ -886,15 +1315,20 @@ def build_context(
     """
     Builds the LLM context string.
 
-    Context order (highest priority first):
-      1. Spec nodes from Neo4j       — verified precise facts, always first
-      2. Full page blocks            — N-1/N/N+1 of rank-1, rank-2 page
-      3. Fallback chunk text         — ranks 3-8, tables formatted as bullet lists
+    When CONTEXT_GREEDY is enabled (env RAG_CONTEXT_GREEDY=1), delegates to
+    _build_context_greedy() which selects items by value density (score/char)
+    instead of fixed priority order.
 
-    The page_blocks argument is injected between specs and fallback chunks.
-    If page_blocks fills the budget, fallback chunks are skipped entirely.
-    If metadata is not available (page_blocks=[]), falls back to original
-    all-chunks behaviour — fully backward compatible.
+    Default behaviour (CONTEXT_GREEDY=0):
+      Context order (highest priority first):
+        1. Spec nodes from Neo4j       — verified precise facts, always first
+        2. Full page blocks            — N-1/N/N+1 of rank-1, rank-2 page
+        3. Fallback chunk text         — ranks 3-8, tables formatted as bullet lists
+
+      The page_blocks argument is injected between specs and fallback chunks.
+      If page_blocks fills the budget, fallback chunks are skipped entirely.
+      If metadata is not available (page_blocks=[]), falls back to original
+      all-chunks behaviour — fully backward compatible.
 
     Returns:
         (context, usage)
@@ -911,6 +1345,10 @@ def build_context(
         This lets retrieve_bundle build source entries that reflect what the LLM
         actually saw, instead of every retrieved candidate.
     """
+    if CONTEXT_GREEDY:
+        return _build_context_greedy(
+            chunks, query, specs, max_chars, page_blocks, expansions
+        )
     parts: list[str] = []
     total = 0
     usage: dict[str, Any] = {
@@ -958,9 +1396,21 @@ def build_context(
         return context, usage
 
     # ── Block N+: Fallback chunk text for ranks 3-8 ───────────────────────────
-    # Skip rank-1 and rank-2 if page blocks were provided for them — those are
-    # represented in context via the page expansion above.
-    fallback_chunks = chunks[2:] if (page_blocks and len(chunks) > 2) else chunks
+    # Skip chunks whose IDs were already covered by page expansion — only omit
+    # those that actually have page content, rather than blanket-skipping by rank
+    # offset (which can drop rank-1 when its page was not found but rank-2's was).
+    expanded_cids: set[str] = set()
+    if expansions:
+        for e in expansions:
+            cid = e.get("expanded_from_chunk_id")
+            if cid:
+                expanded_cids.add(cid)
+    if expanded_cids:
+        fallback_chunks = [
+            c for c in chunks if c.get("chunk_id") not in expanded_cids
+        ]
+    else:
+        fallback_chunks = chunks
 
     # Tables kept first so partial tables can be skipped atomically, but within
     # each type we now respect the reranker order (descending rerank_score).
@@ -979,7 +1429,7 @@ def build_context(
     )
     ordered = table_chunks + text_chunks
 
-    ce = None
+    _reranker = None
 
     for c in ordered:
         chunk_type = c.get("chunk_type", "text")
@@ -992,7 +1442,13 @@ def build_context(
             if not block:
                 raw = (c.get("text") or "").strip()
                 if raw:
-                    block = f"[Table | Book: {bid} | Page: {pr[0]}-{pr[1]}]\n{raw}"
+                    ts_path = " > ".join(c.get("section_path") or [])
+                    citation = (
+                        f"[Table | Book: {bid} | § {ts_path} | Page: {pr[0]}-{pr[1]}]"
+                        if ts_path
+                        else f"[Table | Book: {bid} | Page: {pr[0]}-{pr[1]}]"
+                    )
+                    block = f"{citation}\n{raw}"
             if not block:
                 continue
             if total + len(block) > max_chars:
@@ -1002,10 +1458,13 @@ def build_context(
             text = (c.get("text") or "").strip()
             if not text:
                 continue
-            label = f"[Book: {bid} | Page: {pr[0]}-{pr[1]}]"
-            if path_s:
-                label += f" | Section: {path_s}"
-            label += "\n"
+            # Enhanced citation: [Book: X | § Section Name | Page: Y]
+            citation = (
+                f"[Book: {bid} | § {path_s} | Page: {pr[0]}-{pr[1]}]"
+                if path_s
+                else f"[Book: {bid} | Page: {pr[0]}-{pr[1]}]"
+            )
+            label = citation + "\n"
 
             if len(text.split()) <= LONG_CHUNK_WORDS:
                 block = label + text
@@ -1026,10 +1485,10 @@ def build_context(
                     block = label + text[:4000]
                 else:
                     try:
-                        if ce is None:
-                            ce = get_reranker()
-                        seg_scores = ce.predict([(query, seg) for seg in segs])
-                        best_i = max(range(len(segs)), key=lambda i: seg_scores[i])
+                        if _reranker is None:
+                            _reranker = get_reranker()
+                        seg_results = _reranker.rerank(query, segs)
+                        best_i = seg_results[0]["index"]
                         block = label + segs[best_i]
                     except Exception:
                         block = label + segs[0][:4000]
@@ -1049,43 +1508,158 @@ def build_context(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# QUERY CLASSIFICATION
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+# Pattern order matters: more specific patterns checked first.
+# comparison > process > spec_lookup > overview
+QUERY_PATTERNS: dict[str, re.Pattern] = {
+    # 1. Comparison — strongest signal (vs, versus, compare, difference)
+    "comparison": re.compile(
+        r"\b(vs|versus|compare|difference)\b",
+        re.I,
+    ),
+    # 2. Process — how/explain/describe/sequence/steps/procedure
+    "process": re.compile(
+        r"(how\s+(do|does|is|are|was)|explain|describe|sequence|steps|process|procedure)",
+        re.I,
+    ),
+    # 3. Spec lookup
+    #    a) "what is the X of/in/for Y" (flexible: allows multiple words between article and preposition)
+    #    b) value + engineering unit: e.g. "58 bar", "799 kN", "120 s"
+    #    c) model numbers: e.g. "S200", "PSLV-C50", "PS4"
+    #    d) keywords: value, spec, parameter
+    "spec_lookup": re.compile(
+        r"(?:"
+        r"what\s+(?:is|are)\s+(?:the\s+)+[\w\s]{3,60}?\s+(?:of|for|in)(?:\s+|$)|"
+        r"\b\d+(?:\.\d+)?\s*(?:kn|mpa|bar|kg|s\b|km|n\b|m\b|mm|cm|kw|mw|%|k\b|psi|rpm|t\b|tonne|hz|sec|min|hr|mn)\b|"
+        r"\b[A-Z]+-?\d+\b|"
+        r"\b(value|spec|parameter)s?\b"
+        r")",
+        re.I,
+    ),
+    # 4. Overview — kept last so "what is" doesn't eat spec_lookup queries
+    "overview": re.compile(
+        r"^(what\s+is|tell\s+me\s+about|summarize|overview)",
+        re.I,
+    ),
+}
+
+
+@time_it
+def classify_query(query: str) -> str:
+    """
+    Classifies a user query into a type for routing to specialized retrieval.
+
+    Returns one of: "spec_lookup", "process", "comparison", "overview", "general".
+    """
+    if not query:
+        return "general"
+    for qtype, pattern in QUERY_PATTERNS.items():
+        if pattern.search(query):
+            return qtype
+    return "general"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # MAIN RETRIEVAL + STREAMING
 # ─────────────────────────────────────────────────────────────────────────────
 
 
 @log_process
 def retrieve_bundle(query: str, book_ids: list[str], mode: str) -> dict[str, Any]:
-    cfg = MODE_CONFIG.get(mode, MODE_CONFIG["balanced"])
+    cfg = dict(MODE_CONFIG.get(mode, MODE_CONFIG["balanced"]))  # copy so overrides don't mutate
     prop_lim = cfg.get("prop_retrieve_limit", PROP_RETRIEVE_LIMIT)
     sect_lim = cfg.get("sect_retrieve_limit", SECT_RETRIEVE_LIMIT)
 
-    # Steps 1-6: unchanged
-    prop_hits = search_propositions(query, book_ids, prop_lim)
+    # ── Query classification & routing ────────────────────────────────────────
+    query_type = classify_query(query) if ENABLE_QUERY_CLASSIFICATION else "general"
+    type_overrides = (
+        QUERY_TYPE_OVERRIDES.get(mode, {}).get(query_type, QUERY_TYPE_GENERAL)
+        if ENABLE_QUERY_CLASSIFICATION else QUERY_TYPE_GENERAL
+    )
+
+    # Apply type overrides on top of the mode config
+    effective_final_top_n = max(1, cfg["final_top_n"] + type_overrides.get("final_top_n_adjust", 0))
+    effective_context_max_chars = max(2000, cfg["context_max_chars"] + type_overrides.get("context_max_chars_adjust", 0))
+    effective_boost_mult = type_overrides.get("boost_both_mult", 1.0)
+    effective_page_range = type_overrides.get("page_expand_range", 1)
+    cross_book = type_overrides.get("cross_book", False)
+
+    # cross_book: ignore user's book filter and search all books
+    # Use empty list (not None) so downstream functions don't need `or []` guards
+    effective_book_ids: list[str] = [] if cross_book else (book_ids or [])
+
+    if query_type != "general":
+        logger.info(
+            "[QUERY] type=%s | final_top_n=%d | ctx_chars=%d | boost_mult=%.1f | "
+            "page_range=%d | cross_book=%s",
+            query_type, effective_final_top_n, effective_context_max_chars,
+            effective_boost_mult, effective_page_range, cross_book,
+        )
+
+    # Steps 1-6: use effective_book_ids instead of original book_ids
+    prop_hits = search_propositions(query, effective_book_ids, prop_lim)
     entity_terms = extract_query_entities(query)
-    neo4j_section_names = neo4j_sections_for_entities(book_ids, entity_terms)
-    specs = neo4j_specs_for_terms(book_ids, entity_terms)
+    neo4j_section_names = neo4j_sections_for_entities(effective_book_ids, entity_terms)
+    specs = neo4j_specs_for_terms(effective_book_ids, entity_terms)
 
     parent_chunk_ids = list(
         {p["parent_chunk_id"] for p in prop_hits if p.get("parent_chunk_id")}
     )
-    parent_sections = fetch_sections_by_chunk_ids(parent_chunk_ids, book_ids)
+    parent_sections = fetch_sections_by_chunk_ids(parent_chunk_ids, effective_book_ids)
     direct_sections = search_sections_direct(
-        query, book_ids, neo4j_section_names, sect_lim
+        query, effective_book_ids, neo4j_section_names, sect_lim
     )
     candidates = merge_candidates(parent_sections, direct_sections, neo4j_section_names)
-    top = rerank_candidates(query, candidates, cfg["final_top_n"])
 
-    # Step 7: Page expansion
-    # expand_to_pages() returns ([], []) gracefully if metadata not found,
-    # so this is fully backward compatible with books ingested before
-    # build_metadata.py was added to the pipeline.
-    page_blocks, expansions = expand_to_pages(top)
+    # Step 6: Rerank — fetch a larger pool when MMR is enabled so there
+    # are enough candidates for diversity selection.
+    pool_n = effective_final_top_n * MMR_POOL_MULTIPLIER if ENABLE_MMR else effective_final_top_n
+    top_reranked = rerank_candidates(query, candidates, pool_n, boost_mult=effective_boost_mult)
 
-    # Step 8: Build context — now also returns what actually reached the context.
-    context, usage = build_context(
-        top, query, specs, cfg["context_max_chars"], page_blocks, expansions
+    # Step 6b: MMR diversity
+    if ENABLE_MMR and len(top_reranked) > effective_final_top_n:
+        top = mmr_select(top_reranked, effective_final_top_n, MMR_LAMBDA)
+        logger.info(
+            "[MMR] applied | pool=%d | selected=%d | lambda=%.2f",
+            len(top_reranked), len(top), MMR_LAMBDA,
+        )
+    else:
+        top = top_reranked[:effective_final_top_n]
+
+    # Step 7: Page expansion with dynamic range
+    page_blocks, expansions = expand_to_pages(top, page_expand_range=effective_page_range)
+
+    # Step 8: Build context with adjusted budget
+    # For overview/process queries, reserve budget for a section hierarchy summary
+    hierarchy_block = (
+        extract_section_hierarchy(effective_book_ids, expansions)
+        if query_type in ("overview", "process") and expansions
+        else None
     )
-    system_prompt = get_system_prompt(mode)
+    hierarchy_chars = len(hierarchy_block) + 200 if hierarchy_block else 0  # +200 for "\n\n---\n\n" separator
+
+    # Ensure detail context gets at least 1200 chars after reserving for hierarchy
+    detail_budget = max(1200, effective_context_max_chars - hierarchy_chars)
+
+    context, usage = build_context(
+        top, query, specs,
+        detail_budget,
+        page_blocks, expansions,
+    )
+
+    # Prepend hierarchy block before the detail context
+    if hierarchy_block and context:
+        context = hierarchy_block + "\n\n---\n\n" + context
+        logger.info(
+            "[HIERARCHY] prepended for query_type=%s | block=%d chars | detail=%d chars | total=%d",
+            query_type, len(hierarchy_block), len(context) - len(hierarchy_block) - 6, len(context),
+        )
+
+    # Build system prompt with query-type-specific instructions
+    system_prompt = get_system_prompt(mode, query_type)
 
     # ── Sources: reflect what the LLM ACTUALLY saw ────────────────────────────
     # Map rank-1 / rank-2 chunk -> did its page make it into context? If so, we
@@ -1181,6 +1755,113 @@ def _history_block(history: list[dict]) -> str:
         f"{'User' if m.get('role') == 'user' else 'Assistant'}: {m.get('content') or ''}"
         for m in history
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HIERARCHICAL CONTEXT (4.4)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@log_process
+def extract_section_hierarchy(
+    book_ids: list[str],
+    expansions: list[dict],
+) -> str:
+    """
+    Builds a section hierarchy summary from the pages that are in context.
+
+    Reads metadata for each book that has expanded pages, extracts section
+    paths, builds a tree, and for each leaf section includes the first
+    sentence as a preview.
+
+    Returns a formatted Markdown string like:
+
+    ## Document Structure
+
+    **PSLV-C50**
+    - 4.3 Propulsion System
+      - **4.3.1 Vikas Engine**
+        → The Vikas engine is a liquid-fueled rocket engine...
+      - **4.3.2 S200 Booster**
+        → The S200 is a solid rocket booster...
+    - 5.0 Payload Fairing
+      → The payload fairing protects the satellite...
+
+    Returns empty string if no expansions or metadata is unavailable.
+    """
+    if not expansions:
+        return ""
+
+    # Collect unique (book_id, page) tuples from expansions
+    seen: set[tuple[str, int]] = set()
+    book_pages: dict[str, set[int]] = {}
+    for e in expansions:
+        bid = e.get("book_id", "")
+        page = e.get("page", 0)
+        if not bid:
+            continue
+        key = (bid, page)
+        if key in seen:
+            continue
+        seen.add(key)
+        if bid not in book_pages:
+            book_pages[bid] = set()
+        book_pages[bid].add(page)
+
+    if not book_pages:
+        return ""
+
+    lines: list[str] = ["## Document Structure", ""]
+
+    for bid in sorted(book_pages.keys()):
+        meta = _load_metadata(bid)
+        if not meta:
+            continue
+
+        lines.append(f"**{bid}**")
+
+        # Collect all (section_path, first_sentence) tuples for this book
+        section_entries: list[tuple[list[str], str]] = []
+        for page_num in sorted(book_pages[bid]):
+            entry = meta.get(str(page_num))
+            if not entry:
+                continue
+            sections = entry.get("sections") or []
+            if not sections:
+                continue
+            content = (entry.get("full_content") or "").strip()
+            first = _first_sentence(content) if content else f"[Page {page_num}]"
+            if not first:
+                first = f"[Page {page_num}]"
+            section_entries.append((sections, first))
+
+        # Build indented hierarchy — deduplicate paths so each section
+        # appears only once even across multiple pages.
+        seen_paths: set[str] = set()
+        for sections, first in section_entries:
+            for depth, sec in enumerate(sections):
+                indent = "  " * (depth + 1)
+                path_key = " > ".join(sections[: depth + 1])
+                if path_key in seen_paths:
+                    continue
+                seen_paths.add(path_key)
+                if depth == len(sections) - 1:
+                    # Leaf section — bold + first sentence preview
+                    lines.append(f"{indent}- **{sec}**")
+                    if first:
+                        lines.append(f"{indent}  → {first}")
+                else:
+                    # Parent section — just the name
+                    lines.append(f"{indent}- {sec}")
+
+        lines.append("")
+
+    result = "\n".join(lines).strip()
+    # If the result only has the header and optional book names but no actual
+    # section entries (i.e., no lines with "- "), return empty.
+    if result == "## Document Structure" or not any(" - " in l for l in lines):
+        return ""  # no actual content added
+    return result
 
 
 @time_it
