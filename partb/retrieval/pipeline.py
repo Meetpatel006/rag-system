@@ -63,6 +63,7 @@ from partb.config import (
     BOOST_BOTH,
     COLLECTION_PROPS,
     COLLECTION_SECTIONS,
+    CONTEXT_GREEDY,
     ENABLE_MMR,
     ENABLE_QUERY_CLASSIFICATION,
     ENTITY_LABELS,
@@ -1018,6 +1019,222 @@ def _rerank_score_one(reranker, query: str, text: str) -> float:
 _rerank_log_counter = 0
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# GREEDY CONTEXT ASSEMBLY (4.1a)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@log_process
+def _build_context_greedy(
+    chunks: list[dict],
+    query: str,
+    specs: list[dict],
+    max_chars: int,
+    page_blocks: list[str] | None = None,
+    expansions: list[dict] | None = None,
+) -> tuple[str, dict]:
+    """
+    Greedy context assembly — selects items by value density (score/char)
+    instead of fixed priority order (specs → pages → chunks).
+
+    Algorithm:
+      1. Always include spec block first (highest value density, small footprint).
+      2. Build an item pool from page expansions + fallback chunks.
+      3. Score each item by rerank_score / len(text) (value density).
+      4. Sort by density descending; pick greedily until budget is full.
+      5. Tables kept atomic: if a table doesn't fit the remaining budget, skip it.
+
+    Usage tracking: page_blocks retain their expansion metadata so the source
+    list in retrieve_bundle() reflects what the LLM actually saw.
+
+    Returns (context, usage) with the same schema as build_context().
+    """
+    parts: list[str] = []
+    total = 0
+    usage: dict[str, Any] = {
+        "used_chunk_ids": set(),
+        "used_pages": [],
+        "specs_included": False,
+        "total_chars": 0,
+    }
+
+    # ── Block 1: Spec nodes (always included, highest priority) ──
+    spec_block = format_specs_block(specs)
+    if spec_block:
+        parts.append(spec_block)
+        total += len(spec_block)
+        usage["specs_included"] = True
+
+    if total >= max_chars:
+        context = "\n\n---\n\n".join(parts)
+        usage["total_chars"] = len(context)
+        return context, usage
+
+    # ── Build a chunk_id → rerank_score map for page-expansion scoring ──
+    chunk_score_map: dict[str, float] = {
+        c.get("chunk_id", ""): c.get("rerank_score", 0.0)
+        for c in chunks
+        if c.get("chunk_id")
+    }
+
+    # ── Helper to format a text chunk with label and long-chunk handling ──
+    _greedy_reranker = None  # local ref for long-chunk segmentation
+
+    def _format_text_chunk(c: dict) -> str | None:
+        nonlocal _greedy_reranker
+        text = (c.get("text") or "").strip()
+        if not text:
+            return None
+        pr = c.get("page_range") or [0, 0]
+        bid = c.get("book_id") or "?"
+        path_s = " > ".join(c.get("section_path") or [])
+        label = f"[Book: {bid} | Page: {pr[0]}-{pr[1]}]"
+        if path_s:
+            label += f" | Section: {path_s}"
+        label += "\n"
+
+        if len(text.split()) <= LONG_CHUNK_WORDS:
+            return label + text
+
+        # Long chunk: segment on sentences, rerank segments, pick best
+        sents = _sentences(text)
+        segs: list[str] = []
+        cur = ""
+        for s in sents:
+            if len(cur.split()) + len(s.split()) <= 220:
+                cur = (cur + " " + s).strip()
+            else:
+                if cur:
+                    segs.append(cur)
+                cur = s
+        if cur:
+            segs.append(cur)
+        if not segs:
+            return label + text[:4000]
+
+        try:
+            if _greedy_reranker is None:
+                _greedy_reranker = get_reranker()
+            seg_results = _greedy_reranker.rerank(query, segs)
+            best_i = seg_results[0]["index"]
+            return label + segs[best_i]
+        except Exception:
+            return label + segs[0][:4000]
+
+    # ── Build item pool ────────────────────────────────────────────────
+    # Each item: {text, score, density, type, chunk_id, expansion_idx}
+    items: list[dict] = []
+
+    # Add page blocks from expansion — inherit score from source chunk
+    if page_blocks and expansions:
+        exp_by_idx = expansions  # aligned 1:1 with page_blocks
+        for i, pb in enumerate(page_blocks):
+            if not pb or not pb.strip():
+                continue
+            score = 0.0
+            if i < len(exp_by_idx):
+                src_cid = exp_by_idx[i].get("expanded_from_chunk_id")
+                if src_cid:
+                    score = chunk_score_map.get(src_cid, 0.0)
+            density = score / max(1, len(pb))
+            items.append({
+                "text": pb,
+                "score": score,
+                "density": density,
+                "type": "page",
+                "chunk_id": None,
+                "expansion_idx": i,
+            })
+
+    # Add fallback chunks (skip rank-1 and rank-2 if page_blocks were used)
+    fallback_chunks = chunks[2:] if (page_blocks and len(chunks) > 2) else chunks
+    for c in fallback_chunks:
+        chunk_type = c.get("chunk_type", "text")
+        cid = c.get("chunk_id", "")
+        score = c.get("rerank_score", 0.0)
+
+        if chunk_type == "table":
+            block = format_table_for_llm(c)
+            if not block:
+                raw = (c.get("text") or "").strip()
+                if raw:
+                    pr = c.get("page_range") or [0, 0]
+                    bid = c.get("book_id") or "?"
+                    block = f"[Table | Book: {bid} | Page: {pr[0]}-{pr[1]}]\n{raw}"
+            if not block:
+                continue
+            density = score / max(1, len(block))
+            items.append({
+                "text": block,
+                "score": score,
+                "density": density,
+                "type": "table",
+                "chunk_id": cid,
+                "expansion_idx": None,
+            })
+        else:
+            block = _format_text_chunk(c)
+            if not block:
+                continue
+            density = score / max(1, len(block))
+            items.append({
+                "text": block,
+                "score": score,
+                "density": density,
+                "type": "chunk",
+                "chunk_id": cid,
+                "expansion_idx": None,
+            })
+
+    # ── Sort by density descending ──
+    items.sort(key=lambda x: x["density"], reverse=True)
+
+    # ── Greedily select items until budget is full ──
+    for item in items:
+        text = item["text"]
+        text_len = len(text)
+
+        # Tables: keep atomic — skip if doesn't fully fit
+        if item["type"] == "table":
+            if total + text_len > max_chars:
+                continue
+        elif item["type"] == "page":
+            # Page blocks: trim if partial fits, skip if too small remnant
+            if total + text_len > max_chars:
+                remaining = max_chars - total
+                if remaining > 500:
+                    text = text[:remaining]
+                    text_len = len(text)
+                else:
+                    continue
+        else:
+            # Chunks: trim if partial fits
+            if total + text_len > max_chars:
+                remaining = max_chars - total
+                if remaining > 200:
+                    text = text[:remaining]
+                    text_len = len(text)
+                else:
+                    continue
+
+        parts.append(text)
+        total += text_len
+
+        # Track usage
+        if item["type"] == "page" and item["expansion_idx"] is not None:
+            if expansions and item["expansion_idx"] < len(expansions):
+                usage["used_pages"].append(expansions[item["expansion_idx"]])
+        elif item.get("chunk_id"):
+            usage["used_chunk_ids"].add(item["chunk_id"])
+
+        if total >= max_chars:
+            break
+
+    context = "\n\n---\n\n".join(parts)
+    usage["total_chars"] = len(context)
+    return context, usage
+
+
 @log_process
 def build_context(
     chunks: list[dict],
@@ -1030,15 +1247,20 @@ def build_context(
     """
     Builds the LLM context string.
 
-    Context order (highest priority first):
-      1. Spec nodes from Neo4j       — verified precise facts, always first
-      2. Full page blocks            — N-1/N/N+1 of rank-1, rank-2 page
-      3. Fallback chunk text         — ranks 3-8, tables formatted as bullet lists
+    When CONTEXT_GREEDY is enabled (env RAG_CONTEXT_GREEDY=1), delegates to
+    _build_context_greedy() which selects items by value density (score/char)
+    instead of fixed priority order.
 
-    The page_blocks argument is injected between specs and fallback chunks.
-    If page_blocks fills the budget, fallback chunks are skipped entirely.
-    If metadata is not available (page_blocks=[]), falls back to original
-    all-chunks behaviour — fully backward compatible.
+    Default behaviour (CONTEXT_GREEDY=0):
+      Context order (highest priority first):
+        1. Spec nodes from Neo4j       — verified precise facts, always first
+        2. Full page blocks            — N-1/N/N+1 of rank-1, rank-2 page
+        3. Fallback chunk text         — ranks 3-8, tables formatted as bullet lists
+
+      The page_blocks argument is injected between specs and fallback chunks.
+      If page_blocks fills the budget, fallback chunks are skipped entirely.
+      If metadata is not available (page_blocks=[]), falls back to original
+      all-chunks behaviour — fully backward compatible.
 
     Returns:
         (context, usage)
@@ -1055,6 +1277,10 @@ def build_context(
         This lets retrieve_bundle build source entries that reflect what the LLM
         actually saw, instead of every retrieved candidate.
     """
+    if CONTEXT_GREEDY:
+        return _build_context_greedy(
+            chunks, query, specs, max_chars, page_blocks, expansions
+        )
     parts: list[str] = []
     total = 0
     usage: dict[str, Any] = {

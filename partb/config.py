@@ -149,6 +149,9 @@ QUERY_TYPE_OVERRIDES: dict[str, dict[str, dict]] = {
 QUERY_TYPE_GENERAL = {"boost_both_mult": 1.0, "page_expand_range": 1, "final_top_n_adjust": 0, "context_max_chars_adjust": 0, "cross_book": False}
 
 
+# Greedy context allocation — select items by value density (score/chars)
+# instead of fixed priority order (specs → pages → chunks).
+CONTEXT_GREEDY = os.environ.get("RAG_CONTEXT_GREEDY", "1") == "1"
 
 
 # Apply Qdrant/Neo env for processing.* imports (ingest_vectors / ingest_graph)
