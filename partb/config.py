@@ -90,18 +90,17 @@ BOOST_BOTH = float(os.environ.get("RAG_BOOST_BOTH", "0.12"))
 LONG_CHUNK_WORDS = int(os.environ.get("RAG_LONG_CHUNK_WORDS", "450"))
 
 # ── Reranker tuning ──────────────────────────────────────────────────────────
-# The bundled CrossEncoder is an XLM-RoBERTa model with max_position_embeddings
-# = 514 (~512 usable tokens). Scoring a full section chunk (>400 words) against a
-# query means it is hard-truncated, so the relevant passage often never reaches
-# the model. RERANK_SEGMENT_* control the segment-max workaround: long candidates
-# are split into overlapping segments and scored as the max segment score.
-RERANK_SEGMENT_TOKENS = int(os.environ.get("RAG_RERANK_SEGMENT_TOKENS", "220"))
-RERANK_FULL_CHUNK_WORDS = int(os.environ.get("RAG_RERANK_FULL_CHUNK_WORDS", "400"))
+# Jina Reranker v3 has 131K context and processes ALL candidate documents
+# listwise in a single forward pass via model.rerank(query, documents).
+# Segment-max pooling is only needed for text exceeding 131K tokens.
+RERANK_SEGMENT_TOKENS = int(os.environ.get("RAG_RERANK_SEGMENT_TOKENS", "60000"))
+RERANK_FULL_CHUNK_WORDS = int(os.environ.get("RAG_RERANK_FULL_CHUNK_WORDS", "80000"))
 
-# Drop candidates whose rerank score is below this floor. The bundled reranker's
-# sentence_bert_config.json declares activation_fn=Sigmoid, so scores are in 0..1.
-# Tune empirically after reading the score-distribution logs (rerank_candidates
-# logs min/median/max per query). 0.0 = no filtering.
+# Drop candidates whose rerank score is below this floor. Jina Reranker v3
+# produces unbounded logit scores (not sigmoid-squashed), so the absolute
+# values differ from the previous BGE model. Tune empirically after reading
+# the score-distribution logs (rerank_candidates logs min/median/max per
+# query). 0.0 = no filtering.
 RERANK_MIN_SCORE = float(os.environ.get("RAG_RERANK_MIN_SCORE", "0.0"))
 
 # Score-distribution logging sample rate — log min/median/max of rerank scores

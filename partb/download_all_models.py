@@ -1,6 +1,7 @@
 import os
 from pathlib import Path
-from sentence_transformers import SentenceTransformer, CrossEncoder
+from sentence_transformers import SentenceTransformer
+from transformers import AutoModel
 
 os.environ["HF_TOKEN"] = "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"
 
@@ -12,9 +13,9 @@ nomic_dir.mkdir(parents=True, exist_ok=True)
 reranker_dir.mkdir(parents=True, exist_ok=True)
 
 print(f"Downloading Reranker to {reranker_dir}...")
-# Best open-source reranker
-reranker = CrossEncoder("BAAI/bge-reranker-base")
-reranker.save(str(reranker_dir))
+# Jina Reranker v3 — 131K context, listwise state-of-the-art reranker
+reranker = AutoModel.from_pretrained("jinaai/jina-reranker-v3", trust_remote_code=True)
+reranker.save_pretrained(str(reranker_dir))
 
 print(f"Downloading Nomic to {nomic_dir}...")
 # Best open-source embeddings model

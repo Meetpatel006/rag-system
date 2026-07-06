@@ -7,7 +7,7 @@ CHANGES IN THIS VERSION vs previous:
 
   NEW — Step 7: Page Expansion
   ─────────────────────────────
-  After CrossEncoder reranking (Step 6), the pipeline now expands the
+  After Jina Reranker v3 listwise reranking (Step 6), the pipeline now expands the
   top ranked chunks to full page content using {book_id}_metadata.json
   produced by Part A's build_metadata.py.
 
@@ -137,12 +137,13 @@ def get_neo4j():
 def get_reranker():
     global _reranker
     if _reranker is None:
-        from sentence_transformers import CrossEncoder
+        from transformers import AutoModel
 
         cfg_path = RERANKER_DIR / "config.json"
         if not cfg_path.is_file():
             raise FileNotFoundError(f"Reranker not found at {RERANKER_DIR}")
-        _reranker = CrossEncoder(str(RERANKER_DIR))
+        _reranker = AutoModel.from_pretrained(str(RERANKER_DIR), trust_remote_code=True)
+        _reranker.eval()
     return _reranker
 
 
@@ -578,11 +579,14 @@ def rerank_candidates(query: str, candidates: list[dict], top_n: int) -> list[di
     if not candidates:
         return []
     try:
-        ce = get_reranker()
-        for c in candidates:
-            c["rerank_score"] = _rerank_score_one(ce, query, c.get("text") or "")
-            if c.get("from_qdrant") and c.get("from_neo4j"):
-                c["rerank_score"] += BOOST_BOTH
+        reranker = get_reranker()
+        texts = [c.get("text", "") or "" for c in candidates]
+        results = reranker.rerank(query, texts)
+        for r in results:
+            idx = r["index"]
+            candidates[idx]["rerank_score"] = r["relevance_score"]
+            if candidates[idx].get("from_qdrant") and candidates[idx].get("from_neo4j"):
+                candidates[idx]["rerank_score"] += BOOST_BOTH
     except Exception as exc:
         logging.warning("Reranker failed (%s); using Qdrant scores.", exc)
         for c in candidates:
@@ -817,8 +821,9 @@ def _segment_windows(text: str, max_words: int) -> list[str]:
     aligned on sentence boundaries. Each window starts ~25% into the previous
     one so a relevant passage straddling a boundary is still scored intact.
 
-    Used to defeat CrossEncoder truncation at rerank time: a long section chunk
-    is scored as the MAX over its windows rather than the (truncated) whole.
+    Safety net for extremely long text — Jina Reranker v3 handles 131K
+    tokens so most chunks score in a single pass, but beyond that we
+    segment-max pool.
     """
     text = (text or "").strip()
     if not text:
@@ -850,24 +855,24 @@ def _segment_windows(text: str, max_words: int) -> list[str]:
 
 
 @time_it
-def _rerank_score_one(ce, query: str, text: str) -> float:
+def _rerank_score_one(reranker, query: str, text: str) -> float:
     """
     Scores a single (query, chunk) pair, segment-max pooling long chunks.
 
-    The CrossEncoder truncates at ~512 tokens. For chunks longer than
-    RERANK_FULL_CHUNK_WORDS we split into windows and take the max score, so a
-    relevant passage sitting past the truncation point is still found.
+    Jina Reranker v3 has 131K context so most chunks fit in one pass.
+    For chunks longer than RERANK_FULL_CHUNK_WORDS we split into windows
+    and take the max score.
     """
     text = (text or "").strip()
     if not text:
         return 0.0
     if len(text.split()) <= RERANK_FULL_CHUNK_WORDS:
-        return float(ce.predict([(query, text)])[0])
+        return float(reranker.rerank(query, [text])[0]["relevance_score"])
     windows = _segment_windows(text, RERANK_SEGMENT_TOKENS)
     if not windows:
-        return float(ce.predict([(query, text[: RERANK_SEGMENT_TOKENS * 5])])[0])
-    scores = ce.predict([(query, w) for w in windows])
-    return float(max(scores)) if len(scores) else 0.0
+        return float(reranker.rerank(query, [text[: RERANK_SEGMENT_TOKENS * 5]])[0]["relevance_score"])
+    scores = reranker.rerank(query, windows)
+    return float(max(r["relevance_score"] for r in scores)) if scores else 0.0
 
 
 # Monotonic query counter for sampling score-distribution log output.
@@ -979,7 +984,7 @@ def build_context(
     )
     ordered = table_chunks + text_chunks
 
-    ce = None
+    _reranker = None
 
     for c in ordered:
         chunk_type = c.get("chunk_type", "text")
@@ -1026,10 +1031,10 @@ def build_context(
                     block = label + text[:4000]
                 else:
                     try:
-                        if ce is None:
-                            ce = get_reranker()
-                        seg_scores = ce.predict([(query, seg) for seg in segs])
-                        best_i = max(range(len(segs)), key=lambda i: seg_scores[i])
+                        if _reranker is None:
+                            _reranker = get_reranker()
+                        seg_results = _reranker.rerank(query, segs)
+                        best_i = seg_results[0]["index"]
                         block = label + segs[best_i]
                     except Exception:
                         block = label + segs[0][:4000]
