@@ -64,6 +64,7 @@ from partb.config import (
     COLLECTION_PROPS,
     COLLECTION_SECTIONS,
     ENABLE_MMR,
+    ENABLE_QUERY_CLASSIFICATION,
     ENTITY_LABELS,
     GLINER_QUERY_THRESHOLD,
     LONG_CHUNK_WORDS,
@@ -80,6 +81,8 @@ from partb.config import (
     PORTABLE_DIR,
     PROP_RETRIEVE_LIMIT,
     QDRANT_URL,
+    QUERY_TYPE_GENERAL,
+    QUERY_TYPE_OVERRIDES,
     RERANKER_DIR,
     RERANK_FULL_CHUNK_WORDS,
     RERANK_LOG_DISTRIBUTION_EVERY,
@@ -593,7 +596,18 @@ def merge_candidates(
 
 
 @log_process
-def rerank_candidates(query: str, candidates: list[dict], top_n: int) -> list[dict]:
+def rerank_candidates(query: str, candidates: list[dict], top_n: int, boost_mult: float = 1.0) -> list[dict]:
+    """
+    Rerank candidates using the Jina Reranker v3 listwise model.
+
+    Args:
+        query:     The user query.
+        candidates: List of candidate dicts with 'text' key.
+        top_n:     Number of top candidates to return.
+        boost_mult: Multiplier for BOOST_BOTH when a candidate comes from
+                    both Qdrant and Neo4j. Used by query classification to
+                    boost spec_lookup candidates higher.
+    """
     if not candidates:
         return []
     try:
@@ -604,14 +618,14 @@ def rerank_candidates(query: str, candidates: list[dict], top_n: int) -> list[di
             idx = r["index"]
             candidates[idx]["rerank_score"] = r["relevance_score"]
             if candidates[idx].get("from_qdrant") and candidates[idx].get("from_neo4j"):
-                candidates[idx]["rerank_score"] += BOOST_BOTH
+                candidates[idx]["rerank_score"] += BOOST_BOTH * boost_mult
     except Exception as exc:
         logging.warning("Reranker failed (%s); using Qdrant scores.", exc)
         for c in candidates:
             base = c.get("qdrant_score")
             c["rerank_score"] = float(base) if isinstance(base, (int, float)) else 0.0
             if c.get("from_qdrant") and c.get("from_neo4j"):
-                c["rerank_score"] += BOOST_BOTH
+                c["rerank_score"] += BOOST_BOTH * boost_mult
 
     # Score-distribution logging (sampled) so RERANK_MIN_SCORE / BOOST_BOTH can
     # be calibrated against real data rather than guessed.
@@ -629,7 +643,7 @@ def rerank_candidates(query: str, candidates: list[dict], top_n: int) -> list[di
             )
             logger.info(
                 "[RERANK] dist | n=%d | min=%.4f | median=%.4f | max=%.4f | "
-                "boosted=%d | top1_score=%.4f | floor=%.4f",
+                "boosted=%d | top1_score=%.4f | floor=%.4f | boost_mult=%.1f",
                 n,
                 raw[0],
                 median,
@@ -637,6 +651,7 @@ def rerank_candidates(query: str, candidates: list[dict], top_n: int) -> list[di
                 boosted,
                 raw[-1],
                 RERANK_MIN_SCORE,
+                boost_mult,
             )
 
     # Score floor — drop candidates that scored below the configured minimum.
@@ -773,14 +788,17 @@ def load_page_content(book_id: str, page_number: int) -> str | None:
 
 
 @log_process
-def expand_to_pages(top_chunks: list[dict]) -> tuple[list[str], list[dict]]:
+def expand_to_pages(
+    top_chunks: list[dict],
+    page_expand_range: int = 1,
+) -> tuple[list[str], list[dict]]:
     """
     Step 7: Expands top ranked chunks to full page content from metadata.
 
-    rank-1 chunk on page N:
-      → fetch pages N-1, N, N+1
+    rank-1 chunk on page N with page_expand_range=R:
+      → fetch pages N-R .. N .. N+R
       → cap combined at PAGE_EXPAND_MAX_CHARS
-      → if over cap: drop N-1 first, then trim N+1 tail
+      → if over cap: drop outermost pages first, then trim the far edge
 
     rank-2 chunk:
       → fetch its single page only
@@ -788,6 +806,13 @@ def expand_to_pages(top_chunks: list[dict]) -> tuple[list[str], list[dict]]:
 
     ranks 3+:
       → not expanded here — handled by fallback chunk text in build_context()
+
+    Args:
+        top_chunks:       List of reranked chunks.
+        page_expand_range: Number of pages to fetch before/after the main page.
+                           0 = main page only (no adjacent expansion).
+                           1 = N-1, N, N+1 (default, current behaviour).
+                           2 = N-2, N-1, N, N+1, N+2.
 
     Returns:
         (page_blocks, expansions)
@@ -830,39 +855,61 @@ def expand_to_pages(top_chunks: list[dict]) -> tuple[list[str], list[dict]]:
             })
         return content
 
-    # ── Rank-1: 3-page expansion (N-1, N, N+1) ───────────────────────────────
+    # ── Rank-1: dynamic multi-page expansion (N-R .. N .. N+R) ────────────────
     rank1 = top_chunks[0]
     bid1 = rank1.get("book_id") or ""
     pr1 = rank1.get("page_range") or [0, 0]
     n1 = int(pr1[0]) if pr1 else 0
     cid1 = rank1.get("chunk_id") or ""
 
-    if bid1 and n1 > 0:
-        prev_content = _fetch(bid1, n1 - 1, cid1, 1, "prev")  # N-1
-        main_content = _fetch(bid1, n1, cid1, 1, "main")      # N
-        next_content = _fetch(bid1, n1 + 1, cid1, 1, "next")  # N+1
-
-        # Enforce combined character budget
-        combined_len = sum(
-            len(c) for c in [prev_content, main_content, next_content] if c
-        )
-
-        if combined_len > PAGE_EXPAND_MAX_CHARS:
-            # Drop N-1 first (least critical of the three)
-            if prev_content:
-                combined_len -= len(prev_content)
-                prev_content = None
-            # Trim N+1 tail if still over budget
-            if combined_len > PAGE_EXPAND_MAX_CHARS and next_content:
-                trim_to = PAGE_EXPAND_MAX_CHARS - len(main_content or "")
-                if trim_to > 200:
-                    next_content = next_content[:trim_to]
-                else:
-                    next_content = None
-
-        for content in [prev_content, main_content, next_content]:
+    if bid1 and n1 > 0 and page_expand_range > 0:
+        # Fetch all pages in range [N-R, N+R]
+        page_contents: dict[int, str] = {}
+        for offset in range(-page_expand_range, page_expand_range + 1):
+            if offset < 0:
+                relation = "prev"
+            elif offset == 0:
+                relation = "main"
+            else:
+                relation = "next"
+            content = _fetch(bid1, n1 + offset, cid1, 1, relation)
             if content:
-                page_blocks.append(content)
+                page_contents[offset] = content
+
+        # Enforce combined character budget — drop outermost pages first
+        combined_len = sum(len(c) for c in page_contents.values())
+        if combined_len > PAGE_EXPAND_MAX_CHARS and len(page_contents) > 1:
+            # Sort offsets by absolute distance from main (furthest first)
+            offsets = sorted(page_contents.keys(), key=lambda o: abs(o), reverse=True)
+            for offset in offsets:
+                if combined_len <= PAGE_EXPAND_MAX_CHARS:
+                    break
+                if offset == 0:
+                    continue  # never drop the main page
+                combined_len -= len(page_contents[offset])
+                del page_contents[offset]
+
+        # Trim the farthest remaining non-main page if still over budget
+        if combined_len > PAGE_EXPAND_MAX_CHARS and len(page_contents) > 1:
+            offsets = sorted(page_contents.keys(), key=lambda o: abs(o), reverse=True)
+            for offset in offsets:
+                if offset == 0:
+                    continue
+                trim_to = len(page_contents[offset]) - (combined_len - PAGE_EXPAND_MAX_CHARS)
+                if trim_to > 200:
+                    page_contents[offset] = page_contents[offset][:trim_to]
+                    combined_len = sum(len(c) for c in page_contents.values())
+                break  # only trim one page
+
+        # Append in reading order (ascending page number)
+        for offset in sorted(page_contents.keys()):
+            page_blocks.append(page_contents[offset])
+
+    elif bid1 and n1 > 0 and page_expand_range == 0:
+        # page_expand_range=0: main page only, no adjacent expansion
+        main_content = _fetch(bid1, n1, cid1, 1, "main")
+        if main_content:
+            page_blocks.append(main_content)
 
     elif bid1:
         # page_range missing or zero — attempt to fetch page 0 as fallback
@@ -1146,56 +1193,133 @@ def build_context(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# QUERY CLASSIFICATION
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+# Pattern order matters: more specific patterns checked first.
+# comparison > process > spec_lookup > overview
+QUERY_PATTERNS: dict[str, re.Pattern] = {
+    # 1. Comparison — strongest signal (vs, versus, compare, difference)
+    "comparison": re.compile(
+        r"\b(vs|versus|compare|difference)\b",
+        re.I,
+    ),
+    # 2. Process — how/explain/describe/sequence/steps/procedure
+    "process": re.compile(
+        r"(how\s+(do|does|is|are|was)|explain|describe|sequence|steps|process|procedure)",
+        re.I,
+    ),
+    # 3. Spec lookup
+    #    a) "what is the X of/in/for Y" (flexible: allows multiple words between article and preposition)
+    #    b) value + engineering unit: e.g. "58 bar", "799 kN", "120 s"
+    #    c) model numbers: e.g. "S200", "PSLV-C50", "PS4"
+    #    d) keywords: value, spec, parameter
+    "spec_lookup": re.compile(
+        r"(?:"
+        r"what\s+(?:is|are)\s+(?:the\s+)+[\w\s]{3,60}?\s+(?:of|for|in)(?:\s+|$)|"
+        r"\b\d+(?:\.\d+)?\s*(?:kn|mpa|bar|kg|s\b|km|n\b|m\b|mm|cm|kw|mw|%|k\b|psi|rpm|t\b|tonne|hz|sec|min|hr|mn)\b|"
+        r"\b[A-Z]+-?\d+\b|"
+        r"\b(value|spec|parameter)s?\b"
+        r")",
+        re.I,
+    ),
+    # 4. Overview — kept last so "what is" doesn't eat spec_lookup queries
+    "overview": re.compile(
+        r"^(what\s+is|tell\s+me\s+about|summarize|overview)",
+        re.I,
+    ),
+}
+
+
+@time_it
+def classify_query(query: str) -> str:
+    """
+    Classifies a user query into a type for routing to specialized retrieval.
+
+    Returns one of: "spec_lookup", "process", "comparison", "overview", "general".
+    """
+    if not query:
+        return "general"
+    for qtype, pattern in QUERY_PATTERNS.items():
+        if pattern.search(query):
+            return qtype
+    return "general"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # MAIN RETRIEVAL + STREAMING
 # ─────────────────────────────────────────────────────────────────────────────
 
 
 @log_process
 def retrieve_bundle(query: str, book_ids: list[str], mode: str) -> dict[str, Any]:
-    cfg = MODE_CONFIG.get(mode, MODE_CONFIG["balanced"])
+    cfg = dict(MODE_CONFIG.get(mode, MODE_CONFIG["balanced"]))  # copy so overrides don't mutate
     prop_lim = cfg.get("prop_retrieve_limit", PROP_RETRIEVE_LIMIT)
     sect_lim = cfg.get("sect_retrieve_limit", SECT_RETRIEVE_LIMIT)
 
-    # Steps 1-6: unchanged
-    prop_hits = search_propositions(query, book_ids, prop_lim)
+    # ── Query classification & routing ────────────────────────────────────────
+    query_type = classify_query(query) if ENABLE_QUERY_CLASSIFICATION else "general"
+    type_overrides = (
+        QUERY_TYPE_OVERRIDES.get(mode, {}).get(query_type, QUERY_TYPE_GENERAL)
+        if ENABLE_QUERY_CLASSIFICATION else QUERY_TYPE_GENERAL
+    )
+
+    # Apply type overrides on top of the mode config
+    effective_final_top_n = max(1, cfg["final_top_n"] + type_overrides.get("final_top_n_adjust", 0))
+    effective_context_max_chars = max(2000, cfg["context_max_chars"] + type_overrides.get("context_max_chars_adjust", 0))
+    effective_boost_mult = type_overrides.get("boost_both_mult", 1.0)
+    effective_page_range = type_overrides.get("page_expand_range", 1)
+    cross_book = type_overrides.get("cross_book", False)
+
+    # cross_book: ignore user's book filter and search all books
+    # Use empty list (not None) so downstream functions don't need `or []` guards
+    effective_book_ids: list[str] = [] if cross_book else (book_ids or [])
+
+    if query_type != "general":
+        logger.info(
+            "[QUERY] type=%s | final_top_n=%d | ctx_chars=%d | boost_mult=%.1f | "
+            "page_range=%d | cross_book=%s",
+            query_type, effective_final_top_n, effective_context_max_chars,
+            effective_boost_mult, effective_page_range, cross_book,
+        )
+
+    # Steps 1-6: use effective_book_ids instead of original book_ids
+    prop_hits = search_propositions(query, effective_book_ids, prop_lim)
     entity_terms = extract_query_entities(query)
-    neo4j_section_names = neo4j_sections_for_entities(book_ids, entity_terms)
-    specs = neo4j_specs_for_terms(book_ids, entity_terms)
+    neo4j_section_names = neo4j_sections_for_entities(effective_book_ids, entity_terms)
+    specs = neo4j_specs_for_terms(effective_book_ids, entity_terms)
 
     parent_chunk_ids = list(
         {p["parent_chunk_id"] for p in prop_hits if p.get("parent_chunk_id")}
     )
-    parent_sections = fetch_sections_by_chunk_ids(parent_chunk_ids, book_ids)
+    parent_sections = fetch_sections_by_chunk_ids(parent_chunk_ids, effective_book_ids)
     direct_sections = search_sections_direct(
-        query, book_ids, neo4j_section_names, sect_lim
+        query, effective_book_ids, neo4j_section_names, sect_lim
     )
     candidates = merge_candidates(parent_sections, direct_sections, neo4j_section_names)
 
     # Step 6: Rerank — fetch a larger pool when MMR is enabled so there
     # are enough candidates for diversity selection.
-    pool_n = cfg["final_top_n"] * MMR_POOL_MULTIPLIER if ENABLE_MMR else cfg["final_top_n"]
-    top_reranked = rerank_candidates(query, candidates, pool_n)
+    pool_n = effective_final_top_n * MMR_POOL_MULTIPLIER if ENABLE_MMR else effective_final_top_n
+    top_reranked = rerank_candidates(query, candidates, pool_n, boost_mult=effective_boost_mult)
 
-    # Step 6b: MMR diversity — reorder candidates to balance relevance
-    # and diversity before page expansion and context building.
-    if ENABLE_MMR and len(top_reranked) > cfg["final_top_n"]:
-        top = mmr_select(top_reranked, cfg["final_top_n"], MMR_LAMBDA)
+    # Step 6b: MMR diversity
+    if ENABLE_MMR and len(top_reranked) > effective_final_top_n:
+        top = mmr_select(top_reranked, effective_final_top_n, MMR_LAMBDA)
         logger.info(
             "[MMR] applied | pool=%d | selected=%d | lambda=%.2f",
             len(top_reranked), len(top), MMR_LAMBDA,
         )
     else:
-        top = top_reranked[:cfg["final_top_n"]]
+        top = top_reranked[:effective_final_top_n]
 
-    # Step 7: Page expansion
-    # expand_to_pages() returns ([], []) gracefully if metadata not found,
-    # so this is fully backward compatible with books ingested before
-    # build_metadata.py was added to the pipeline.
-    page_blocks, expansions = expand_to_pages(top)
+    # Step 7: Page expansion with dynamic range
+    page_blocks, expansions = expand_to_pages(top, page_expand_range=effective_page_range)
 
-    # Step 8: Build context — now also returns what actually reached the context.
+    # Step 8: Build context with adjusted budget
     context, usage = build_context(
-        top, query, specs, cfg["context_max_chars"], page_blocks, expansions
+        top, query, specs, effective_context_max_chars, page_blocks, expansions
     )
     system_prompt = get_system_prompt(mode)
 

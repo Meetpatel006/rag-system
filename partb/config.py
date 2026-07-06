@@ -114,6 +114,42 @@ MMR_LAMBDA = float(os.environ.get("RAG_MMR_LAMBDA", "0.7"))
 MMR_POOL_MULTIPLIER = int(os.environ.get("RAG_MMR_POOL_MULTIPLIER", "2"))
 
 
+# Query classification & routing
+ENABLE_QUERY_CLASSIFICATION = os.environ.get("RAG_ENABLE_QUERY_CLASSIFICATION", "1") == "1"
+
+# Per-(mode, query_type) overrides applied on top of MODE_CONFIG.
+# Each key: mode -> query_type -> {overrides}
+#   boost_both_mult:        Multiplier for BOOST_BOTH when a candidate comes from both Qdrant + Neo4j
+#   page_expand_range:      Pages before/after the main page to fetch (0 = no expansion)
+#   final_top_n_adjust:     Added to the mode's final_top_n (can be negative)
+#   context_max_chars_adjust: Added to the mode's context_max_chars (can be negative)
+#   cross_book:             If True, ignore user's book filter and search all books
+QUERY_TYPE_OVERRIDES: dict[str, dict[str, dict]] = {
+    "fast": {
+        "spec_lookup": {"boost_both_mult": 2.0, "page_expand_range": 1, "final_top_n_adjust": 0, "context_max_chars_adjust": 0, "cross_book": False},
+        "process":     {"boost_both_mult": 1.0, "page_expand_range": 2, "final_top_n_adjust": 0, "context_max_chars_adjust": 0, "cross_book": False},
+        "comparison":  {"boost_both_mult": 1.5, "page_expand_range": 1, "final_top_n_adjust": 2, "context_max_chars_adjust": 0, "cross_book": True},
+        "overview":    {"boost_both_mult": 1.0, "page_expand_range": 0, "final_top_n_adjust": -3, "context_max_chars_adjust": -2000, "cross_book": False},
+    },
+    "balanced": {
+        "spec_lookup": {"boost_both_mult": 2.0, "page_expand_range": 1, "final_top_n_adjust": 0, "context_max_chars_adjust": 0, "cross_book": False},
+        "process":     {"boost_both_mult": 1.0, "page_expand_range": 2, "final_top_n_adjust": 2, "context_max_chars_adjust": 2000, "cross_book": False},
+        "comparison":  {"boost_both_mult": 1.5, "page_expand_range": 1, "final_top_n_adjust": 4, "context_max_chars_adjust": 2000, "cross_book": True},
+        "overview":    {"boost_both_mult": 1.0, "page_expand_range": 0, "final_top_n_adjust": -2, "context_max_chars_adjust": -4000, "cross_book": False},
+    },
+    "deep": {
+        "spec_lookup": {"boost_both_mult": 2.0, "page_expand_range": 1, "final_top_n_adjust": 0, "context_max_chars_adjust": 0, "cross_book": False},
+        "process":     {"boost_both_mult": 1.0, "page_expand_range": 2, "final_top_n_adjust": 2, "context_max_chars_adjust": 2000, "cross_book": False},
+        "comparison":  {"boost_both_mult": 1.5, "page_expand_range": 1, "final_top_n_adjust": 4, "context_max_chars_adjust": 2000, "cross_book": True},
+        "overview":    {"boost_both_mult": 1.0, "page_expand_range": 0, "final_top_n_adjust": -3, "context_max_chars_adjust": -2000, "cross_book": False},
+    },
+}
+
+# Defaults when no type-specific override is defined (e.g. "general" type)
+QUERY_TYPE_GENERAL = {"boost_both_mult": 1.0, "page_expand_range": 1, "final_top_n_adjust": 0, "context_max_chars_adjust": 0, "cross_book": False}
+
+
+
 
 # Apply Qdrant/Neo env for processing.* imports (ingest_vectors / ingest_graph)
 @time_it
