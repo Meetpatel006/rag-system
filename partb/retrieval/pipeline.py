@@ -970,6 +970,18 @@ def expand_to_pages(
 
 
 @time_it
+def _first_sentence(text: str) -> str:
+    """Extract the first sentence from text, up to 200 chars."""
+    text = (text or "").strip()
+    if not text:
+        return ""
+    sents = _sentences(text)
+    if sents:
+        return sents[0][:200]
+    return text[:200]
+
+
+@time_it
 def _sentences(text: str) -> list[str]:
     try:
         import nltk
@@ -1574,9 +1586,31 @@ def retrieve_bundle(query: str, book_ids: list[str], mode: str) -> dict[str, Any
     page_blocks, expansions = expand_to_pages(top, page_expand_range=effective_page_range)
 
     # Step 8: Build context with adjusted budget
-    context, usage = build_context(
-        top, query, specs, effective_context_max_chars, page_blocks, expansions
+    # For overview/process queries, reserve budget for a section hierarchy summary
+    hierarchy_block = (
+        extract_section_hierarchy(effective_book_ids, expansions)
+        if query_type in ("overview", "process") and expansions
+        else None
     )
+    hierarchy_chars = len(hierarchy_block) + 200 if hierarchy_block else 0  # +200 for "\n\n---\n\n" separator
+
+    # Ensure detail context gets at least 1200 chars after reserving for hierarchy
+    detail_budget = max(1200, effective_context_max_chars - hierarchy_chars)
+
+    context, usage = build_context(
+        top, query, specs,
+        detail_budget,
+        page_blocks, expansions,
+    )
+
+    # Prepend hierarchy block before the detail context
+    if hierarchy_block and context:
+        context = hierarchy_block + "\n\n---\n\n" + context
+        logger.info(
+            "[HIERARCHY] prepended for query_type=%s | block=%d chars | detail=%d chars | total=%d",
+            query_type, len(hierarchy_block), len(context) - len(hierarchy_block) - 6, len(context),
+        )
+
     system_prompt = get_system_prompt(mode)
 
     # ── Sources: reflect what the LLM ACTUALLY saw ────────────────────────────
@@ -1673,6 +1707,113 @@ def _history_block(history: list[dict]) -> str:
         f"{'User' if m.get('role') == 'user' else 'Assistant'}: {m.get('content') or ''}"
         for m in history
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HIERARCHICAL CONTEXT (4.4)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@log_process
+def extract_section_hierarchy(
+    book_ids: list[str],
+    expansions: list[dict],
+) -> str:
+    """
+    Builds a section hierarchy summary from the pages that are in context.
+
+    Reads metadata for each book that has expanded pages, extracts section
+    paths, builds a tree, and for each leaf section includes the first
+    sentence as a preview.
+
+    Returns a formatted Markdown string like:
+
+    ## Document Structure
+
+    **PSLV-C50**
+    - 4.3 Propulsion System
+      - **4.3.1 Vikas Engine**
+        → The Vikas engine is a liquid-fueled rocket engine...
+      - **4.3.2 S200 Booster**
+        → The S200 is a solid rocket booster...
+    - 5.0 Payload Fairing
+      → The payload fairing protects the satellite...
+
+    Returns empty string if no expansions or metadata is unavailable.
+    """
+    if not expansions:
+        return ""
+
+    # Collect unique (book_id, page) tuples from expansions
+    seen: set[tuple[str, int]] = set()
+    book_pages: dict[str, set[int]] = {}
+    for e in expansions:
+        bid = e.get("book_id", "")
+        page = e.get("page", 0)
+        if not bid:
+            continue
+        key = (bid, page)
+        if key in seen:
+            continue
+        seen.add(key)
+        if bid not in book_pages:
+            book_pages[bid] = set()
+        book_pages[bid].add(page)
+
+    if not book_pages:
+        return ""
+
+    lines: list[str] = ["## Document Structure", ""]
+
+    for bid in sorted(book_pages.keys()):
+        meta = _load_metadata(bid)
+        if not meta:
+            continue
+
+        lines.append(f"**{bid}**")
+
+        # Collect all (section_path, first_sentence) tuples for this book
+        section_entries: list[tuple[list[str], str]] = []
+        for page_num in sorted(book_pages[bid]):
+            entry = meta.get(str(page_num))
+            if not entry:
+                continue
+            sections = entry.get("sections") or []
+            if not sections:
+                continue
+            content = (entry.get("full_content") or "").strip()
+            first = _first_sentence(content) if content else f"[Page {page_num}]"
+            if not first:
+                first = f"[Page {page_num}]"
+            section_entries.append((sections, first))
+
+        # Build indented hierarchy — deduplicate paths so each section
+        # appears only once even across multiple pages.
+        seen_paths: set[str] = set()
+        for sections, first in section_entries:
+            for depth, sec in enumerate(sections):
+                indent = "  " * (depth + 1)
+                path_key = " > ".join(sections[: depth + 1])
+                if path_key in seen_paths:
+                    continue
+                seen_paths.add(path_key)
+                if depth == len(sections) - 1:
+                    # Leaf section — bold + first sentence preview
+                    lines.append(f"{indent}- **{sec}**")
+                    if first:
+                        lines.append(f"{indent}  → {first}")
+                else:
+                    # Parent section — just the name
+                    lines.append(f"{indent}- {sec}")
+
+        lines.append("")
+
+    result = "\n".join(lines).strip()
+    # If the result only has the header and optional book names but no actual
+    # section entries (i.e., no lines with "- "), return empty.
+    if result == "## Document Structure" or not any(" - " in l for l in lines):
+        return ""  # no actual content added
+    return result
 
 
 @time_it
