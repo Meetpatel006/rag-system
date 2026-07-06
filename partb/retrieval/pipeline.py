@@ -1197,8 +1197,19 @@ def _build_context_greedy(
                 "expansion_idx": i,
             })
 
-    # Add fallback chunks (skip rank-1 and rank-2 if page_blocks were used)
-    fallback_chunks = chunks[2:] if (page_blocks and len(chunks) > 2) else chunks
+    # Add fallback chunks (skip chunks whose IDs were covered by page expansion)
+    expanded_cids: set[str] = set()
+    if expansions:
+        for e in expansions:
+            cid = e.get("expanded_from_chunk_id")
+            if cid:
+                expanded_cids.add(cid)
+    if expanded_cids:
+        fallback_chunks = [
+            c for c in chunks if c.get("chunk_id") not in expanded_cids
+        ]
+    else:
+        fallback_chunks = chunks
     for c in fallback_chunks:
         chunk_type = c.get("chunk_type", "text")
         cid = c.get("chunk_id", "")
@@ -1385,9 +1396,21 @@ def build_context(
         return context, usage
 
     # ── Block N+: Fallback chunk text for ranks 3-8 ───────────────────────────
-    # Skip rank-1 and rank-2 if page blocks were provided for them — those are
-    # represented in context via the page expansion above.
-    fallback_chunks = chunks[2:] if (page_blocks and len(chunks) > 2) else chunks
+    # Skip chunks whose IDs were already covered by page expansion — only omit
+    # those that actually have page content, rather than blanket-skipping by rank
+    # offset (which can drop rank-1 when its page was not found but rank-2's was).
+    expanded_cids: set[str] = set()
+    if expansions:
+        for e in expansions:
+            cid = e.get("expanded_from_chunk_id")
+            if cid:
+                expanded_cids.add(cid)
+    if expanded_cids:
+        fallback_chunks = [
+            c for c in chunks if c.get("chunk_id") not in expanded_cids
+        ]
+    else:
+        fallback_chunks = chunks
 
     # Tables kept first so partial tables can be skipped atomically, but within
     # each type we now respect the reranker order (descending rerank_score).
