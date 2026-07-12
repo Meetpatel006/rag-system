@@ -77,16 +77,26 @@ STATIC_DIR = _BASE / "static"
 
 print(f"[KRUTRIM] STATIC_DIR: {STATIC_DIR}  exists={STATIC_DIR.exists()}")
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+app.mount("/css", StaticFiles(directory=str(FRONTEND_DIR / "css")), name="css")
+app.mount("/js", StaticFiles(directory=str(FRONTEND_DIR / "js")), name="js")
+app.mount("/fonts", StaticFiles(directory=str(FRONTEND_DIR / "fonts")), name="fonts")
+app.mount("/pages", StaticFiles(directory=str(FRONTEND_DIR / "pages")), name="pages")
 
 app.include_router(auth_router)
 app.include_router(chats_router)
 app.include_router(meta_router)
 app.include_router(pdf_router)
 
+from fastapi.responses import FileResponse
+
+@app.get("/isro-logo.svg")
+async def serve_logo():
+    return FileResponse(FRONTEND_DIR / "isro-logo.svg")
+
 @app.get("/", response_class=HTMLResponse)
 @async_time_it
 async def serve_frontend():
-    html_path = FRONTEND_DIR / "chat.html"
+    html_path = FRONTEND_DIR / "index.html"
     if html_path.is_file():
         return HTMLResponse(content=html_path.read_text(encoding="utf-8"))
-    return HTMLResponse("<h2>frontend/chat.html not found</h2>", status_code=404)
+    return HTMLResponse("<h2>frontend/index.html not found</h2>", status_code=404)
