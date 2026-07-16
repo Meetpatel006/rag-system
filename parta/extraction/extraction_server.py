@@ -59,6 +59,13 @@ WORKER_PRIORITY_IPS = [
     "192.168.1.10",
     "192.168.1.11",
     "192.168.1.12",
+    "192.168.1.13",
+    "192.168.1.14",
+    "192.168.1.15",
+    "192.168.1.16",
+    "192.168.1.17",
+    "192.168.1.18",
+    "192.168.1.19",
 ]
 PRIORITY_GRACE_SECONDS = 10
 
@@ -69,6 +76,7 @@ neo4j_jobs: Dict[str, dict] = {}
 qdrant_jobs: Dict[str, dict] = {}
 job_lock = threading.Lock()
 worker_last_seen: Dict[str, float] = {}
+worker_ip_map: Dict[str, str] = {}  # worker_id → IP for busy/idle tracking
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -193,6 +201,23 @@ def _assign_pending_job(
             now - worker_last_seen.get(f"{expected_kind}:{ip}", 0) <= PRIORITY_GRACE_SECONDS
             for ip in WORKER_PRIORITY_IPS[:rank]
         )
+        # ── Don't count busy higher-priority workers as available ────────
+        busy_ips: set = set()
+        live_assigned = set()
+        for state in store.values():
+            if state["is_finished"]:
+                continue
+            for job in state["jobs"].values():
+                if job["status"] == "PROCESSING" and job["assigned_to"]:
+                    live_assigned.add(job["assigned_to"])
+                    ip = worker_ip_map.get(job["assigned_to"])
+                    if ip and ip in WORKER_PRIORITY_IPS[:rank]:
+                        busy_ips.add(ip)
+        # Drop stale worker_ip_map entries for workers no longer assigned.
+        for wid in list(worker_ip_map.keys()):
+            if wid not in live_assigned:
+                del worker_ip_map[wid]
+        idle_higher_priority = active_higher_priority - len(busy_ips)
         pending_jobs = sum(
             1
             for state in store.values()
@@ -200,9 +225,9 @@ def _assign_pending_job(
             for job in state["jobs"].values()
             if job["status"] == "PENDING" and job["job_kind"] == expected_kind
         )
-        if active_higher_priority and pending_jobs <= active_higher_priority:
+        if idle_higher_priority > 0 and pending_jobs <= idle_higher_priority:
             logger.info(
-                "%s worker %s (%s) waiting for higher-priority worker",
+                "%s worker %s (%s) waiting for idle higher-priority worker",
                 expected_kind.upper(),
                 worker_id,
                 worker_ip,
@@ -256,6 +281,7 @@ def _assign_pending_job(
             job["assigned_to"] = worker_id
             job["assigned_at"] = now
             job["lease_deadline"] = now + LEASE_SECONDS
+            worker_ip_map[worker_id] = worker_ip
 
             logger.info(
                 "%s job %s assigned to %s (%s)",

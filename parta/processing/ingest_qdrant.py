@@ -235,7 +235,12 @@ def _get_colbert_model():
     global _colbert_model
     if _colbert_model is None:
         from fastembed import LateInteractionTextEmbedding
-        _colbert_model = LateInteractionTextEmbedding("colbert-ir/colbertv2.0")
+
+        _colbert_model = LateInteractionTextEmbedding(
+            "colbert-ir/colbertv2.0",
+            cache_dir=str(Path(__file__).resolve().parent.parent / "portable"),
+            local_files_only=True,
+        )
     return _colbert_model
 
 @time_it
