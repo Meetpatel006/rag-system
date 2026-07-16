@@ -139,7 +139,7 @@ async def _stream_via_ollama_lb(
 
         # -- 2. Stream tokens from the allocated GPU server --
         stream_url = f"http://{allocated_server}:{OLLAMA_STREAM_PORT}/ollama"
-        body = {"prompt": prompt, "model": allocated_model, "stream": True}
+        body = {"prompt": prompt, "model": allocated_model, "stream": True, "think": False}
 
         logger.info("[OLLAMA-LB] Stream request | url=%s | model=%s | prompt_chars=%s", stream_url, allocated_model, len(prompt))
         try:
@@ -218,6 +218,7 @@ async def _stream_litellm(
         "messages": messages,
         "stream": True,
         "temperature": 0.2,
+        "thinking": {"type": "disabled"},
     }
 
     async with httpx.AsyncClient(timeout=httpx.Timeout(timeout)) as client:
@@ -262,7 +263,7 @@ async def _stream_ollama(
     model = cfg.get("ollama_model") or cfg.get("litellm_model")
     prompt = _prompt_from_messages(messages)
     url = f"{OLLAMA_URL}/api/generate"
-    body = {"model": model, "prompt": prompt, "stream": True}
+    body = {"model": model, "prompt": prompt, "stream": True, "think": False}
 
     async with httpx.AsyncClient(timeout=httpx.Timeout(timeout)) as client:
         try:
