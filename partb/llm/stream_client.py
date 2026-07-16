@@ -44,26 +44,27 @@ async def stream_llm(
     model = cfg.get("ollama_model", "mistral:7b-instruct")
     prompt = _prompt_from_messages(messages)
     
-    # Try Ollama LB first
-    lb_failed = False
-    tokens_yielded = 0
-    try:
-        async for ev in _stream_via_ollama_lb(prompt, model, mode, timeout):
-            if ev.get("type") == "error":
-                logger.warning("[OLLAMA-LB] yielded error: %s", ev.get("message"))
-                if tokens_yielded == 0:
-                    lb_failed = True
-                    break
-                else:
-                    yield ev
-                    return
-            if ev.get("type") == "token":
-                tokens_yielded += 1
-            yield ev
-        if not lb_failed:
-            return
-    except Exception as e:
-        logger.warning("[OLLAMA-LB] Failed, falling back to LiteLLM: %s", e)
+    # Ollama LB skipped — going directly to LiteLLM
+    # # Try Ollama LB first
+    # lb_failed = False
+    # tokens_yielded = 0
+    # try:
+    #     async for ev in _stream_via_ollama_lb(prompt, model, mode, timeout):
+    #         if ev.get("type") == "error":
+    #             logger.warning("[OLLAMA-LB] yielded error: %s", ev.get("message"))
+    #             if tokens_yielded == 0:
+    #                 lb_failed = True
+    #                 break
+    #             else:
+    #                 yield ev
+    #                 return
+    #         if ev.get("type") == "token":
+    #             tokens_yielded += 1
+    #         yield ev
+    #     if not lb_failed:
+    #         return
+    # except Exception as e:
+    #     logger.warning("[OLLAMA-LB] Failed, falling back to LiteLLM: %s", e)
         
     # Fallback to LiteLLM
     litellm_failed = False
